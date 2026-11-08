@@ -1,0 +1,349 @@
+"use client"
+
+import { Button, cn, Spinner } from "@superserve/ui"
+import { useQueryClient } from "@tanstack/react-query"
+import Link from "next/link"
+import { useCallback, useSyncExternalStore } from "react"
+
+import {
+  BannerShell,
+  ManageAction,
+} from "@/components/billing/plan-aware-banner"
+import { useQueryScope } from "@/components/query-provider"
+import { useBillingCapabilities } from "@/hooks/use-billing-capabilities"
+import { useBillingContext } from "@/hooks/use-billing-context"
+import { useBillingPayment } from "@/hooks/use-billing-payment"
+import { useBillingReturnNotice } from "@/hooks/use-billing-return-notice"
+import { useBillingSummary } from "@/hooks/use-billing-summary"
+import { useTeamEntry } from "@/hooks/use-billing-v2"
+import { useSubmitOnce } from "@/hooks/use-submit-once"
+import { useUser } from "@/hooks/use-user"
+import type {
+  BillingSummaryResponse,
+  BillingTrialBalance,
+  BillingTrialBlock,
+} from "@/lib/api/billing"
+import type { SignupPlanContext } from "@/lib/api/signup-plan"
+import { pickerOfferSellable, pickerPlanLabel } from "@/lib/billing/plan-picker"
+import {
+  type AwaitingPlanState,
+  planPickerPath,
+  signupCheckoutPath,
+  trialPlanOffer,
+} from "@/lib/billing/signup-checkout-paths"
+
+// SS-484 billingTrialRunway accepts observations strictly newer than 15 minutes.
+// Expire cached observations too, including when background polling is suspended.
+const RUNWAY_FRESHNESS_MS = 15 * 60_000
+// The API has checked freshness using its clock; allow browsers slightly behind it.
+const RUNWAY_CLOCK_SKEW_MS = 5 * 60_000
+
+export function hasCurrentUrgentRunway(
+  trial: Pick<BillingTrialBalance, "runway_state" | "runway_observed_at">,
+  now: number,
+) {
+  const observed = Date.parse(trial.runway_observed_at ?? "")
+  return (
+    trial.runway_state === "under_24h" &&
+    observed <= now + RUNWAY_CLOCK_SKEW_MS &&
+    observed > now - RUNWAY_FRESHNESS_MS
+  )
+}
+
+const getServerUrgency = () => false
+
+function useCurrentUrgentRunway(trial: BillingTrialBalance | null | undefined) {
+  const observedAt = trial?.runway_observed_at
+  const runwayState = trial?.runway_state
+  const subscribe = useCallback(
+    (notify: () => void) => {
+      const delay =
+        Date.parse(observedAt ?? "") + RUNWAY_FRESHNESS_MS - Date.now()
+      if (
+        !Number.isFinite(delay) ||
+        delay <= 0 ||
+        delay > RUNWAY_FRESHNESS_MS + RUNWAY_CLOCK_SKEW_MS
+      )
+        return () => {}
+      const timer = window.setTimeout(notify, delay)
+      return () => window.clearTimeout(timer)
+    },
+    [observedAt],
+  )
+  const getSnapshot = useCallback(
+    () =>
+      hasCurrentUrgentRunway(
+        { runway_state: runwayState, runway_observed_at: observedAt },
+        Date.now(),
+      ),
+    [observedAt, runwayState],
+  )
+  return useSyncExternalStore(subscribe, getSnapshot, getServerUrgency)
+}
+
+function formatUsd(amount: number | null | undefined): string | null {
+  return typeof amount === "number" && Number.isFinite(amount)
+    ? new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+      }).format(amount)
+    : null
+}
+
+export type TrialStage =
+  | "trial"
+  | "ended"
+  | "unavailable"
+  | "check_unavailable"
+  | "unknown"
+  | "payment_failed"
+  | "plan_required"
+
+// The trial's stage from its entry state, balance and the server's trial block.
+// The entry state and the summary load independently, so an explicit
+// trial_block decides first, whatever the entry state: check_unavailable, then
+// exhausted, then unavailable (denied). Without one, "ended" needs proof: an
+// exhausted or expired balance, or a live trial whose credit ran out. A null
+// block is a failed reason read or a generic denial, so a team that is not on
+// a live trial stays "unknown" and the copy claims nothing about the trial.
+export function trialStage(
+  entry: AwaitingPlanState,
+  trial: BillingTrialBalance | null | undefined,
+  block?: BillingTrialBlock | null,
+): TrialStage {
+  if (entry === "payment_failed" || entry === "plan_required") return entry
+  if (block === "trial_check_unavailable") return "check_unavailable"
+  if (block === "trial_exhausted") return "ended"
+  if (block === "trial_unavailable") return "unavailable"
+  if (trial?.state === "exhausted" || trial?.state === "expired") return "ended"
+  if (entry === "trial_ended") return "unknown"
+  if (!trial) return "trial"
+  // Any other balance state (such as no_grant) is not a live trial.
+  if (trial.state !== "active") return "unknown"
+  const remaining = trial.remaining_usd
+  return typeof remaining === "number" &&
+    Number.isFinite(remaining) &&
+    remaining <= 0
+    ? "ended"
+    : "trial"
+}
+
+function TrialEntryBanner({
+  entry,
+  summary,
+}: {
+  entry: AwaitingPlanState
+  summary: BillingSummaryResponse
+}) {
+  const { teamKey } = useBillingContext()
+  const scope = useQueryScope()
+  const offers = useBillingCapabilities().data?.offers
+  const signup = useQueryClient().getQueryData<SignupPlanContext>([
+    "signup-plan",
+    teamKey,
+  ])
+  const user = useUser().user
+  const account = signup?.userId ?? user?.id
+  const locator = account && teamKey ? { account, team: teamKey } : null
+  const requested = trialPlanOffer(signup?.requestedOffer)
+  const selected =
+    requested && pickerOfferSellable(offers, requested) ? requested : undefined
+  const stage = trialStage(entry, summary.trial, summary.trial_block)
+  const remaining = formatUsd(summary.trial?.remaining_usd)
+  const plan = selected ? pickerPlanLabel(offers, selected) : null
+  const upgrade = plan ? `Upgrade to ${plan}` : "Upgrade"
+  const canManage = scope === "self" && summary.permissions.can_manage
+  const { submitting, onSubmit } = useSubmitOnce<true>()
+  return (
+    <BannerShell
+      tone={stage === "trial" ? "info" : "danger"}
+      label={
+        stage === "plan_required" || stage === "unknown"
+          ? "No plan"
+          : "Free trial"
+      }
+      action={
+        <ManageAction canManage={canManage}>
+          {selected && locator ? (
+            <form
+              method="post"
+              action={signupCheckoutPath(selected, locator)}
+              onSubmit={onSubmit(true)}
+            >
+              <Button type="submit" size="sm" disabled={submitting !== null}>
+                {submitting ? <Spinner size="sm" /> : null}
+                {upgrade}
+              </Button>
+            </form>
+          ) : (
+            <Button
+              size="sm"
+              render={
+                <Link href={planPickerPath("upgrade", undefined, locator)} />
+              }
+            >
+              {upgrade}
+            </Button>
+          )}
+          {selected && locator ? (
+            <Link
+              href={planPickerPath("upgrade", selected, locator)}
+              className="self-center underline underline-offset-4"
+            >
+              Other plans
+            </Link>
+          ) : null}
+        </ManageAction>
+      }
+    >
+      {stage === "plan_required" ? (
+        <>
+          Free covers your first team. Choose a plan to run sandboxes in this
+          one.
+        </>
+      ) : stage === "payment_failed" ? (
+        <>
+          We couldn&apos;t confirm a card for your plan. Your sandboxes are
+          paused and nothing is deleted. Upgrade to resume.
+        </>
+      ) : stage === "unavailable" ? (
+        <>
+          The free trial isn&apos;t available for this account. Upgrade to run
+          sandboxes.
+        </>
+      ) : stage === "unknown" ? (
+        <>Upgrade to run sandboxes.</>
+      ) : stage === "check_unavailable" ? (
+        <>
+          We couldn&apos;t confirm the free trial for this account because a
+          required check didn&apos;t complete. Upgrade to run sandboxes.
+        </>
+      ) : stage === "ended" ? (
+        <>
+          Your free trial has ended. Your sandboxes are paused. A sandbox set to
+          auto-delete after a pause can still be deleted. Upgrade to resume.
+        </>
+      ) : (
+        <>
+          You&apos;re on a free trial
+          {remaining ? (
+            <>
+              {" "}
+              with <strong>{remaining} left</strong>
+            </>
+          ) : null}
+          . Upgrade to keep your sandboxes running once it&apos;s used up.
+        </>
+      )}
+    </BannerShell>
+  )
+}
+
+export function TrialBillingBanner() {
+  const { ready } = useBillingContext()
+  const summaryQuery = useBillingSummary()
+  const summary = ready && !summaryQuery.isError ? summaryQuery.data : undefined
+  const entryQuery = useTeamEntry(true)
+  useBillingReturnNotice()
+  if (entryQuery.isPending || entryQuery.isError) return null
+  const entry = entryQuery.data
+  if (!summary?.permissions?.can_view) return null
+  // A paid plan is activating: the trial is over, so no banner asks for a card.
+  if (entry === "activating") return null
+  if (entry) return <TrialEntryBanner entry={entry} summary={summary} />
+  return <LegacyTrialBanner summary={summary} />
+}
+
+function LegacyTrialBanner({ summary }: { summary: BillingSummaryResponse }) {
+  const { teamKey } = useBillingContext()
+  const { submitting, available, openSession } = useBillingPayment(
+    summary,
+    teamKey,
+  )
+  const trial = summary.trial
+  const currentUrgentRunway = useCurrentUrgentRunway(trial)
+
+  // An explicit trial_block decides first, as in trialStage: check_unavailable,
+  // then exhausted, then unavailable (denied). Without one, only the balance.
+  const block = summary.trial_block
+  const blocked =
+    block === "trial_check_unavailable" ||
+    block === "trial_exhausted" ||
+    block === "trial_unavailable"
+  if (
+    !blocked &&
+    (!trial || (trial.state !== "active" && trial.state !== "exhausted"))
+  )
+    return null
+
+  const exhausted = block === "trial_exhausted" || trial?.state === "exhausted"
+  const urgent = blocked || exhausted || currentUrgentRunway
+  const remaining = formatUsd(trial?.remaining_usd)
+
+  return (
+    <div
+      role="status"
+      aria-label="Free trial billing"
+      className={cn(
+        "flex flex-wrap items-center justify-between gap-x-6 gap-y-2 border-b px-4 py-3 text-sm",
+        urgent
+          ? "border-red-500/40 bg-red-100 text-red-950 dark:bg-red-950 dark:text-red-100"
+          : "border-yellow-500/40 bg-yellow-100 text-yellow-950 dark:bg-yellow-950 dark:text-yellow-100",
+      )}
+    >
+      <p className="min-w-0 flex-1 basis-72">
+        {block === "trial_check_unavailable" ? (
+          <>
+            We couldn&apos;t confirm the free trial for this account because a
+            required check didn&apos;t complete. Add a payment method to run
+            sandboxes.
+          </>
+        ) : block === "trial_exhausted" ? (
+          <>
+            Your free trial credit has run out. Add a payment method to continue
+            running sandboxes.
+          </>
+        ) : block === "trial_unavailable" ? (
+          <>
+            The free trial isn&apos;t available for this account. Add a payment
+            method to run sandboxes.
+          </>
+        ) : exhausted ? (
+          <>
+            Your free trial credit has run out. Add a payment method to continue
+            running sandboxes.
+          </>
+        ) : urgent ? (
+          <>
+            Based on your recent usage, your trial credit may run out within the
+            next 24 hours, and any running sandboxes will automatically be
+            stopped. Add a payment method to continue running sandboxes.
+          </>
+        ) : (
+          <>
+            You&apos;re on a free trial
+            {remaining ? (
+              <>
+                {" "}
+                with <strong>{remaining} remaining</strong>
+              </>
+            ) : null}
+            . Add a payment method to keep running sandboxes once it&apos;s used
+            up.
+          </>
+        )}
+      </p>
+      {summary.permissions.can_manage ? (
+        <Button
+          size="sm"
+          disabled={!available || submitting !== null}
+          onClick={() => void openSession()}
+        >
+          {submitting ? "Loading..." : "Add Payment"}
+        </Button>
+      ) : (
+        <p>Contact your team&apos;s billing administrator.</p>
+      )}
+    </div>
+  )
+}

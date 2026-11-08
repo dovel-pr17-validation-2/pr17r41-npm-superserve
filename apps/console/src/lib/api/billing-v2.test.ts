@@ -1,0 +1,361 @@
+import { describe, expect, it } from "vitest"
+
+import {
+  proCheckoutTermsSchema,
+  teamPlanSchema,
+  proCheckoutResponseSchema,
+  type CatalogPlan,
+  catalogPlansOf,
+  checkoutTermsFor,
+  ENTERPRISE_MEETING_URL,
+  isLowBalance,
+  planAction,
+  type PrepaidBalance,
+  PRO_UPGRADE_PATH,
+  type TeamPlan,
+  teamEntrySchema,
+} from "./billing-v2"
+
+const limits = {
+  max_concurrent: 1,
+  max_vcpu: 1,
+  max_memory_mib: 1024,
+  max_disk_mib: 4096,
+  max_templates: null,
+}
+const card = (
+  key: string,
+  kind: CatalogPlan["kind"],
+  name: string,
+  funding_policy: CatalogPlan["funding_policy"] = kind === "prepaid"
+    ? "prepaid"
+    : "postpaid",
+): CatalogPlan => ({
+  key,
+  family: key.split("_")[0]!,
+  kind,
+  name,
+  price_label: name,
+  available: true,
+  fee_cents: null,
+  included_cents: null,
+  limits,
+  funding_policy,
+})
+const FREE = card("free", "free", "Free")
+const STARTER = card("starter", "prepaid", "Starter")
+const PRO = card("pro_monthly", "subscription", "Pro")
+const DEVELOPER = card(
+  "developer_monthly",
+  "subscription",
+  "Developer",
+  "prepaid",
+)
+const OTHER = card("other_monthly", "subscription", "Other")
+const ENTERPRISE = card("enterprise", "custom", "Enterprise")
+
+function team(c: CatalogPlan, pending: string | null = null): TeamPlan {
+  return {
+    key: c.key,
+    kind: c.kind,
+    name: c.name,
+    limits,
+    fee_cents: null,
+    included_cents: null,
+    period_start: null,
+    effective_from: "2026-10-01T00:00:00Z",
+    period_end: null,
+    pending_change: pending
+      ? {
+          id: "34971786-dd50-492b-b934-306b63764c4b",
+          pauses_running: true,
+          plan_key: pending,
+          plan_name: pending,
+          effective_at: "2026-11-01T00:00:00Z",
+          undoable: true,
+        }
+      : null,
+  }
+}
+
+describe("planAction", () => {
+  it("upgrades through the purchase pages", () => {
+    expect(planAction(team(FREE), PRO)).toMatchObject({
+      href: PRO_UPGRADE_PATH,
+    })
+    expect(planAction(team(STARTER), PRO)).toMatchObject({
+      href: PRO_UPGRADE_PATH,
+    })
+    expect(planAction(team(FREE), ENTERPRISE)).toMatchObject({
+      href: ENTERPRISE_MEETING_URL,
+      label: "Book a meeting",
+    })
+  })
+
+  it("sells Developer to a team on a plan through the upgrade page", () => {
+    expect(planAction(team(FREE), DEVELOPER)).toEqual({
+      type: "link",
+      href: "/billing/pro/?plan=developer",
+      label: "Get Developer",
+    })
+    expect(planAction(team(FREE), OTHER)).toEqual({ type: "unavailable" })
+  })
+
+  it("never sells Starter to a team that isn't on it", () => {
+    const legacy = team(card("legacy", "legacy_payg", "Pay as you go"))
+    const trial = team(card("trial", "free", "Free trial"))
+    for (const current of [FREE, PRO, ENTERPRISE].map((c) => team(c)))
+      expect(planAction(current, STARTER)).not.toMatchObject({ type: "link" })
+    expect(planAction(legacy, STARTER)).toEqual({ type: "unavailable" })
+    expect(planAction(trial, STARTER)).toEqual({ type: "unavailable" })
+    expect(planAction(team(STARTER), STARTER)).toEqual({ type: "current" })
+    expect(
+      planAction(team(STARTER), { ...STARTER, key: "starter_v2" }),
+    ).toEqual({ type: "unavailable" })
+    expect(planAction(team(PRO, "starter"), STARTER)).toEqual({
+      type: "scheduled",
+    })
+  })
+
+  it("lets legacy pay-as-you-go teams buy Pro but not move to Free", () => {
+    const legacy = team(card("legacy", "legacy_payg", "Pay as you go"))
+    expect(planAction(legacy, PRO)).toMatchObject({
+      href: PRO_UPGRADE_PATH,
+    })
+    expect(planAction(legacy, FREE)).toEqual({ type: "unavailable" })
+  })
+
+  it("offers no move down to credit or Free under pricing v2", () => {
+    expect(planAction(team(PRO), STARTER)).toEqual({ type: "unavailable" })
+    for (const current of [PRO, STARTER, ENTERPRISE])
+      expect(planAction(team(current), FREE)).toEqual({ type: "unavailable" })
+  })
+
+  it("marks the current and scheduled plans and sends Enterprise teams to us", () => {
+    expect(planAction(team(PRO), PRO)).toEqual({ type: "current" })
+    expect(planAction(team(PRO, "free"), FREE)).toEqual({ type: "scheduled" })
+    expect(planAction(team(ENTERPRISE), PRO)).toEqual({ type: "contact" })
+    expect(planAction(team(ENTERPRISE), STARTER)).toEqual({
+      type: "unavailable",
+    })
+  })
+})
+
+describe("planAction edge cases", () => {
+  it("offers no move between subscriptions, and treats another Free key as current", () => {
+    const legacyPro = { ...team(PRO), key: "pro_annual" }
+    expect(planAction(legacyPro, PRO)).toEqual({ type: "unavailable" })
+    expect(planAction(team(DEVELOPER), PRO)).toEqual({ type: "unavailable" })
+    expect(planAction(team(PRO), DEVELOPER)).toEqual({ type: "unavailable" })
+    expect(planAction({ ...team(FREE), key: "free_legacy" }, FREE)).toEqual({
+      type: "current",
+    })
+  })
+
+  it("blocks upgrades while a downgrade is scheduled", () => {
+    expect(planAction(team(STARTER, "free"), PRO)).toEqual({
+      type: "blocked",
+      undoable: true,
+      effectiveAt: "2026-11-01T00:00:00Z",
+    })
+  })
+})
+
+describe("isLowBalance", () => {
+  const balance = (
+    balance_cents: number,
+    enabled: boolean,
+    low_balance?: boolean,
+  ): PrepaidBalance => ({
+    balance_cents,
+    low_balance,
+    auto_recharge: {
+      enabled,
+      threshold_cents: null,
+      amount_cents: null,
+      disabled_reason: null,
+      disabled_at: null,
+      in_flight: false,
+    },
+  })
+
+  it("follows the backend's low-balance flag", () => {
+    expect(isLowBalance(balance(700, false, true))).toBe(true)
+    expect(isLowBalance(balance(1, false, false))).toBe(false)
+    expect(isLowBalance(balance(0, true, false))).toBe(true)
+  })
+})
+
+describe("catalogPlansOf", () => {
+  const free = {
+    family: "free",
+    version: 1,
+    kind: "free",
+    name: "Free",
+    price_label: "$0",
+    tagline: "Explore",
+    features: [],
+    display_only: false,
+    monthly: null,
+    annual: null,
+    credit_summary: "",
+    monthly_credit_cents: null,
+    allowance: {
+      amount_cents: 13,
+      period: "day_window",
+      on_exhausted: "pause",
+      summary: "2h per 24-hour window",
+      compute: { seconds: 7200, vcpu: 1, memory_gib: 1 },
+    },
+    matching: null,
+    limits,
+  }
+  it("reads actual cards without interpreting legacy offers as cards", () => {
+    const plans = catalogPlansOf({
+      pricing_version: "v2",
+      cards: [
+        free,
+        {
+          ...free,
+          family: "pro",
+          kind: "subscription",
+          name: "Pro",
+          price_label: "$250/month",
+          monthly: {
+            offer_key: "pro_monthly",
+            price_cents: 25000,
+            monthly_equivalent_cents: 25000,
+            available: false,
+          },
+          allowance: {
+            amount_cents: 25000,
+            period: "month",
+            on_exhausted: "payg",
+            summary: "$250 per month",
+          },
+        },
+      ],
+      plans: [{ key: "old_offer", family: "old", price_cents: 100000 }],
+    })
+    expect(plans.map((plan) => plan.key)).toEqual(["free", "pro_monthly"])
+    expect(plans[1]).toMatchObject({
+      fee_cents: 25000,
+      included_cents: 25000,
+      price_label: "$250/month",
+      available: false,
+    })
+    expect(planAction(team(FREE), plans[1])).toEqual({ type: "unavailable" })
+  })
+  it("surfaces malformed catalogs as failures instead of empty successful data", () => {
+    expect(() => catalogPlansOf({ plans: [] })).toThrow()
+    expect(() => catalogPlansOf({ cards: [{ family: "broken" }] })).toThrow()
+  })
+})
+
+describe("authoritative Pro checkout terms", () => {
+  const response = {
+    plan: {
+      plan_key: "free",
+      kind: "free",
+      display_name: "Free",
+      limits,
+      effective_from: "2026-10-27T00:00:00Z",
+    },
+    period: { start: "2026-10-01T00:00:00Z", end: "2026-11-01T00:00:00Z" },
+    pending_change: null,
+  }
+  it("retains optional preview and frozen terms without inventing a quote", () => {
+    expect(teamPlanSchema.parse(response)?.pro_checkout).toBeUndefined()
+    const preview = { first_paid_pro_cycle: true, accepted: false }
+    expect(
+      teamPlanSchema.parse({ ...response, pro_checkout: preview })
+        ?.pro_checkout,
+    ).toEqual(preview)
+    const accepted = {
+      ...preview,
+      accepted: true,
+      period_start: "2026-10-27T00:00:00Z",
+      period_end: "2026-11-27T00:00:00Z",
+      first_payment_cents: 0,
+      first_credit_cents: 35789,
+      credit_expires_at: "2026-11-27T00:00:00Z",
+    }
+    expect(
+      teamPlanSchema.parse({ ...response, pro_checkout: accepted })
+        ?.pro_checkout,
+    ).toEqual(accepted)
+  })
+  it.each([
+    { first_paid_pro_cycle: "true", accepted: false },
+    { first_paid_pro_cycle: true },
+    { first_paid_pro_cycle: true, accepted: true, first_payment_cents: -1 },
+    { first_paid_pro_cycle: true, accepted: true, first_credit_cents: 1.5 },
+    {
+      first_paid_pro_cycle: true,
+      accepted: true,
+      first_payment_cents: Number.MAX_SAFE_INTEGER + 1,
+    },
+    { first_paid_pro_cycle: true, accepted: true, period_end: "not a date" },
+  ])("rejects malformed authoritative fields (%j)", (terms) => {
+    expect(proCheckoutTermsSchema.safeParse(terms).success).toBe(false)
+  })
+})
+
+it("preserves frozen checkout terms without a current plan", () => {
+  const terms = {
+    first_paid_pro_cycle: true,
+    accepted: true,
+    first_payment_cents: 0,
+    first_credit_cents: 25000,
+    period_start: "2026-10-27T00:00:00Z",
+    period_end: "2026-11-27T00:00:00Z",
+  }
+  expect(
+    proCheckoutResponseSchema.parse({ plan: null, pro_checkout: terms })
+      .pro_checkout,
+  ).toEqual(terms)
+  expect(
+    teamPlanSchema.parse({
+      plan: null,
+      period: { start: "2026-10-27T00:00:00Z", end: "2026-11-27T00:00:00Z" },
+      pending_change: null,
+      pro_checkout: terms,
+    }),
+  ).toBeNull()
+})
+
+describe("checkoutTermsFor", () => {
+  const terms = (offer_key?: string) => ({
+    offer_key,
+    first_paid_pro_cycle: true,
+    accepted: true,
+  })
+
+  it("shows saved terms only for the plan they were saved for", () => {
+    expect(
+      checkoutTermsFor(terms("developer_monthly"), "developer_monthly"),
+    ).toBeDefined()
+    expect(
+      checkoutTermsFor(terms("developer_monthly"), "pro_monthly"),
+    ).toBeUndefined()
+    expect(checkoutTermsFor(terms(), "pro_monthly")).toBeDefined()
+    expect(checkoutTermsFor(terms(), "developer_monthly")).toBeUndefined()
+  })
+})
+
+describe("teamEntrySchema", () => {
+  it("keeps a team whose paid plan is activating apart from a team without one", () => {
+    expect(teamEntrySchema.parse({ entry_state: "activating" })).toBe(
+      "activating",
+    )
+    expect(
+      teamEntrySchema.parse({
+        entry_state: "trial",
+        pro_checkout: { status: "activating" },
+      }),
+    ).toBe("activating")
+    expect(teamEntrySchema.parse({ entry_state: "trial" })).toBe("trial")
+    expect(teamEntrySchema.parse({ entry_state: "something_new" })).toBeNull()
+    expect(teamEntrySchema.parse({})).toBeNull()
+  })
+})

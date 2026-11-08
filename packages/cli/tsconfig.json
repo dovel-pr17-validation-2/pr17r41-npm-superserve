@@ -1,0 +1,10 @@
+{
+  "extends": "@superserve/typescript-config/base.json",
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM"],
+    "noEmit": true,
+    "types": ["bun"]
+  },
+  "include": ["src/**/*", "tests/**/*", "scripts/**/*"]
+}

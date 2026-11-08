@@ -1,0 +1,59 @@
+import * as matchers from "@testing-library/jest-dom/matchers"
+import type { TestingLibraryMatchers } from "@testing-library/jest-dom/matchers"
+import { cleanup } from "@testing-library/react"
+import { afterEach, beforeEach, expect, vi } from "vitest"
+
+// Register against Console's Vitest; jest-dom's adapter can resolve the root's
+// different Vitest version under Bun's isolated dependency layout.
+expect.extend(matchers)
+
+declare module "vitest" {
+  interface Assertion<T> extends TestingLibraryMatchers<unknown, T> {}
+  interface AsymmetricMatchersContaining extends TestingLibraryMatchers<
+    unknown,
+    unknown
+  > {}
+}
+
+// Silence console.error/warn in tests — the error-path tests intentionally
+// trigger catch blocks that call console.error in the source code.
+beforeEach(() => {
+  vi.spyOn(console, "error").mockImplementation(() => {})
+  vi.spyOn(console, "warn").mockImplementation(() => {})
+  vi.spyOn(console, "log").mockImplementation(() => {})
+})
+
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
+
+// Stub environment variables used by supabase clients + api proxy
+process.env.NEXT_PUBLIC_SUPABASE_URL = "https://test.supabase.co"
+process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "test-anon-key"
+process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-role-key"
+process.env.NEXT_PUBLIC_WEBSITE_URL = "https://www.superserve.ai"
+process.env.NEXT_PUBLIC_APP_URL = "https://console.superserve.ai"
+process.env.SANDBOX_API_URL = "https://api.test.superserve.ai"
+process.env.NEXT_PUBLIC_SANDBOX_HOST = "sandbox.test.superserve.ai"
+process.env.CONSOLE_PROXY_SECRET =
+  "test-secret-must-be-at-least-thirty-two-chars-long-abcdef"
+
+// happy-dom does not expose storage when no document URL is configured.
+// Provide the minimal Web Storage contract used by console tests.
+if (typeof window !== "undefined" && !window.localStorage) {
+  const values = new Map<string, string>()
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, String(value)),
+      removeItem: (key: string) => values.delete(key),
+      clear: () => values.clear(),
+      key: (index: number) => Array.from(values.keys())[index] ?? null,
+      get length() {
+        return values.size
+      },
+    },
+  })
+}

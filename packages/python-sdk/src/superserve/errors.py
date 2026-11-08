@@ -1,0 +1,179 @@
+"""Typed error hierarchy for the Superserve Python SDK."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+class SandboxError(Exception):
+    """Base error for all Superserve SDK errors."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+
+
+class AuthenticationError(SandboxError):
+    def __init__(
+        self,
+        message: str = "Missing or invalid API key",
+        code: str | None = None,
+        status_code: int = 401,
+    ) -> None:
+        super().__init__(message, status_code=status_code, code=code)
+
+
+class ValidationError(SandboxError):
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message, status_code=400, code=code)
+
+
+class NotFoundError(SandboxError):
+    def __init__(
+        self,
+        message: str = "Resource not found",
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=404, code=code)
+
+
+class ConflictError(SandboxError):
+    def __init__(
+        self,
+        message: str = "Sandbox is not in a valid state for this operation",
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=409, code=code)
+
+
+class SandboxTimeoutError(SandboxError):
+    """Raised when a request or polling operation times out."""
+
+    def __init__(self, message: str = "Request timed out") -> None:
+        super().__init__(message)
+
+
+class ServerError(SandboxError):
+    def __init__(
+        self,
+        message: str = "Internal server error",
+        code: str | None = None,
+        status_code: int = 500,
+    ) -> None:
+        super().__init__(message, status_code=status_code, code=code)
+
+
+class RateLimitError(SandboxError):
+    """Raised on 429 responses. ``code`` distinguishes the variant:
+
+    - ``rate_limited`` — request rate exceeded; retry after a short backoff.
+    - ``too_many_builds`` — team has reached its concurrent build limit.
+    - ``too_many_templates`` — team has reached its total template count limit.
+    - ``too_many_sandboxes`` — team has reached its active sandbox count limit.
+    """
+
+    def __init__(
+        self,
+        message: str = "Rate limit exceeded",
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=429, code=code)
+
+
+class BillingError(SandboxError):
+    """Raised on 402 responses: billing does not allow this request.
+    ``code`` distinguishes the variant:
+
+    - ``trial_exhausted`` — the free trial credit is used up.
+    - ``trial_unavailable`` — the free trial is not available for this account.
+    - ``trial_check_unavailable`` — the free trial could not be confirmed because
+      a required check did not complete. Not a denial. Right after sign-up it can
+      last a few seconds while the trial is set up; after that, retrying does not
+      resolve it.
+    - ``billing_ineligible`` — generic; billing does not allow this request.
+    - ``free_allowance_exhausted`` — the free allowance is used up until it resets.
+    - ``sandbox_exceeds_plan_limits`` — the requested size exceeds the plan limits.
+
+    ``action_url`` is where the user can add a card and choose a plan. It is
+    ``None`` unless the API sends one, so older servers leave it unset.
+    """
+
+    def __init__(
+        self,
+        message: str = "Billing does not allow this request",
+        code: str | None = None,
+        action_url: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=402, code=code)
+        self.action_url = action_url
+
+
+class BuildError(SandboxError):
+    """Raised when a template build transitions to status 'failed'.
+
+    `code` is the stable error prefix on `error_message` (e.g. `image_pull_failed`,
+    `step_failed`, `boot_failed`, `snapshot_failed`, `start_cmd_failed`,
+    `ready_cmd_failed`, `build_failed`).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        build_id: str,
+        template_id: str,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, code=code)
+        self.code = code
+        self.build_id = build_id
+        self.template_id = template_id
+
+
+def map_api_error(status_code: int, body: dict[str, Any]) -> SandboxError:
+    """Map an HTTP status code and response body to a typed error."""
+    error_data = body.get("error")
+    if error_data is None and isinstance(body.get("message"), str):
+        # Connect RPC errors (boxd's DesktopService) are flat: {"code", "message"}.
+        error_data = {"message": body["message"], "code": body.get("code")}
+    if isinstance(error_data, dict):
+        # Control-plane errors use ``{"error": {"message": ..., "code": ...}}``.
+        message = error_data.get("message") or f"API error ({status_code})"
+        code = error_data.get("code")
+        action_url = error_data.get("action_url")
+    else:
+        # Data-plane (boxd) errors use a bare string: ``{"error": "..."}``.
+        # Defensively stringify any other non-dict shape so this mapper never
+        # raises -- it runs precisely when a request already failed.
+        message = str(error_data) if error_data else f"API error ({status_code})"
+        code = None
+        action_url = None
+
+    if status_code == 400:
+        return ValidationError(message, code=code)
+    elif status_code in (401, 403):
+        return AuthenticationError(message, code=code, status_code=status_code)
+    elif status_code == 404:
+        return NotFoundError(message, code=code)
+    elif status_code == 409:
+        return ConflictError(message, code=code)
+    elif status_code == 402:
+        return BillingError(
+            message,
+            code=code,
+            action_url=action_url
+            if isinstance(action_url, str) and action_url
+            else None,
+        )
+    elif status_code == 429:
+        return RateLimitError(message, code=code)
+    elif status_code >= 500:
+        return ServerError(message, code=code, status_code=status_code)
+    return SandboxError(message, status_code=status_code, code=code)

@@ -1,0 +1,380 @@
+"use client"
+
+import { Suspense } from "react"
+
+import { TableSkeleton } from "@/components/table-skeleton"
+
+export default function SandboxesPage() {
+  return (
+    <Suspense fallback={<TableSkeleton columns={6} tabs={3} />}>
+      <SandboxesPageContent />
+    </Suspense>
+  )
+}
+
+import { CubeIcon } from "@phosphor-icons/react"
+import {
+  Checkbox,
+  cn,
+  Table,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@superserve/ui"
+import { useRouter, useSearchParams } from "next/navigation"
+import { usePostHog } from "posthog-js/react"
+import { useEffect, useState } from "react"
+
+import { EmptyState } from "@/components/empty-state"
+import { ErrorState } from "@/components/error-state"
+import { PageHeader } from "@/components/page-header"
+import { Pagination } from "@/components/pagination"
+import { ConnectSandboxDialog } from "@/components/sandboxes/connect-sandbox-dialog"
+import { CreateSandboxDialog } from "@/components/sandboxes/create-sandbox-dialog"
+import { DeleteSandboxDialog } from "@/components/sandboxes/delete-sandbox-dialog"
+import { SandboxTableRow } from "@/components/sandboxes/sandbox-table-row"
+import { TakeSnapshotDialog } from "@/components/snapshots/take-snapshot-dialog"
+import { SortableTableHead } from "@/components/sortable-table-head"
+import { StickyHoverTableBody } from "@/components/sticky-hover-table"
+import { TableToolbar } from "@/components/table-toolbar"
+import { useCreateParam } from "@/hooks/use-create-param"
+import { useListParams } from "@/hooks/use-list-params"
+import {
+  useBulkDeleteSandboxes,
+  useDeleteSandbox,
+  usePauseSandbox,
+  useResumeSandbox,
+  useSandboxesPage,
+} from "@/hooks/use-sandboxes"
+import { useSelection } from "@/hooks/use-selection"
+import { SANDBOX_SORT_COLUMNS, type SandboxListParams } from "@/lib/api/types"
+import { SANDBOX_EVENTS } from "@/lib/posthog/events"
+
+const STATUS_TABS = [
+  { label: "All", value: "all" },
+  { label: "Active", value: "active" },
+  { label: "Paused", value: "paused" },
+]
+
+function SandboxesPageContent() {
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const posthog = usePostHog()
+
+  const {
+    page,
+    pageSize,
+    sort,
+    order,
+    q,
+    debouncedQ,
+    setParam,
+    toggleSort,
+    setPage,
+    setPageSize,
+    setSearch,
+  } = useListParams({
+    columns: SANDBOX_SORT_COLUMNS,
+    defaultSort: "created_at",
+  })
+
+  // URL param is user input — an unknown status falls back to "all" instead of
+  // being forwarded to the API.
+  const rawStatus = searchParams.get("status")
+  const statusTab = STATUS_TABS.some((t) => t.value === rawStatus)
+    ? (rawStatus as string)
+    : "all"
+
+  const params: SandboxListParams = {
+    page,
+    pageSize,
+    sort,
+    order,
+    status: statusTab === "all" ? undefined : statusTab,
+    q: debouncedQ || undefined,
+  }
+
+  const [createOpen, setCreateOpen] = useCreateParam()
+  const [connectSandboxId, setConnectSandboxId] = useState<string | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{
+    id: string
+    name: string
+  } | null>(null)
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
+  const [templateRef, setTemplateRef] = useState<string | null>(null)
+  const [snapshotId, setSnapshotId] = useState<string | null>(null)
+  const [snapshotTarget, setSnapshotTarget] = useState<string | null>(null)
+
+  // Launching from a template or a snapshot navigates here with
+  // ?from_template=<name> or ?from_snapshot=<id>. Open the dialog with the
+  // source prefilled, then strip the param so refreshing doesn't re-open.
+  useEffect(() => {
+    const name = searchParams.get("from_template")
+    const snapshot = searchParams.get("from_snapshot")
+    if (!name && !snapshot) return
+    setTemplateRef(name)
+    setSnapshotId(snapshot)
+    setCreateOpen(true)
+    const next = new URLSearchParams(searchParams.toString())
+    next.delete("from_template")
+    next.delete("from_snapshot")
+    const qs = next.toString()
+    router.replace(qs ? `?${qs}` : window.location.pathname)
+  }, [searchParams, router, setCreateOpen])
+
+  const { data, isPending, error, refetch, isPlaceholderData } =
+    useSandboxesPage(params)
+  const sandboxes = data?.items ?? []
+  const total = data?.total ?? 0
+
+  const deleteSandbox = useDeleteSandbox()
+  const bulkDelete = useBulkDeleteSandboxes()
+  const pauseMutation = usePauseSandbox()
+  const resumeMutation = useResumeSandbox()
+
+  const {
+    selected,
+    allSelected,
+    someSelected,
+    toggleAll,
+    toggleOne,
+    clearSelection,
+  } = useSelection(sandboxes)
+
+  const pageCount = Math.max(1, Math.ceil(total / pageSize))
+
+  // If the current page falls past the end (e.g. after deleting the last row on
+  // the last page), snap back to the last valid page.
+  useEffect(() => {
+    if (total > 0 && page > pageCount) setPage(pageCount)
+  }, [total, page, pageCount, setPage])
+
+  // Selection is scoped to the current view — clear it when anything that
+  // changes the visible row set (page, page size, sort, filter, search)
+  // changes, so a bulk action can't hit rows that scrolled off-page.
+  useEffect(() => {
+    clearSelection()
+  }, [page, pageSize, sort, order, statusTab, debouncedQ, clearSelection])
+
+  // Uses debouncedQ (what the current data was fetched with), not q: clearing a
+  // zero-result search would otherwise flash the account-level empty state for
+  // the 300ms until the unfiltered refetch lands.
+  const hasFilters = statusTab !== "all" || debouncedQ !== ""
+  // A truly empty account (no sandboxes at all) gets the create call-to-action.
+  // A zero-result filter/search keeps the toolbar so the user can clear it.
+  // Placeholder data is a stale page shown during a params change — never treat
+  // its total as proof the account is empty.
+  const isEmpty =
+    !isPending && !error && !isPlaceholderData && total === 0 && !hasFilters
+
+  return (
+    <div className="flex h-full flex-col">
+      <PageHeader title="Sandboxes">
+        <CreateSandboxDialog
+          open={createOpen}
+          onOpenChange={(v) => {
+            setCreateOpen(v)
+            if (!v) {
+              setTemplateRef(null)
+              setSnapshotId(null)
+            }
+          }}
+          hideTrigger={isEmpty || isPending}
+          onCreated={(id) => setConnectSandboxId(id)}
+          initialTemplateRef={templateRef}
+          initialSnapshotId={snapshotId}
+        />
+      </PageHeader>
+
+      {isPending ? (
+        <TableSkeleton columns={6} tabs={3} />
+      ) : error ? (
+        <ErrorState message={error.message} onRetry={() => refetch()} />
+      ) : isEmpty ? (
+        <EmptyState
+          icon={CubeIcon}
+          title="No Sandboxes"
+          description="Create a sandbox to run code in an isolated cloud environment."
+          actionLabel="Create Sandbox"
+          onAction={() => setCreateOpen(true)}
+        />
+      ) : (
+        <>
+          <TableToolbar
+            tabs={STATUS_TABS}
+            activeTab={statusTab}
+            onTabChange={(v) => setParam({ status: v === "all" ? null : v })}
+            searchPlaceholder="Search sandboxes..."
+            searchValue={q}
+            onSearchChange={setSearch}
+            selectedCount={selected.size}
+            onClearSelection={clearSelection}
+            onDeleteSelected={() => setBulkDeleteOpen(true)}
+          />
+
+          <div
+            className={cn(
+              "flex-1 overflow-y-auto transition-opacity",
+              isPlaceholderData && "opacity-60",
+            )}
+          >
+            {sandboxes.length === 0 ? (
+              <EmptyState
+                icon={CubeIcon}
+                title="No sandboxes match"
+                description="Try a different search term or status filter."
+              />
+            ) : (
+              <Table>
+                <TableHeader className="sticky top-0 z-10 bg-background/70 backdrop-blur-md">
+                  <TableRow>
+                    <TableHead className="w-10 pr-0">
+                      <Checkbox
+                        checked={allSelected}
+                        indeterminate={someSelected && !allSelected}
+                        onCheckedChange={toggleAll}
+                        aria-label="Select all sandboxes"
+                      />
+                    </TableHead>
+                    <SortableTableHead
+                      column="name"
+                      label="Name"
+                      activeSort={sort}
+                      order={order}
+                      onSort={toggleSort}
+                      className="w-[30%]"
+                    />
+                    <SortableTableHead
+                      column="status"
+                      label="Status"
+                      activeSort={sort}
+                      order={order}
+                      onSort={toggleSort}
+                      className="w-[15%]"
+                    />
+                    <TableHead className="w-[15%]">Resources</TableHead>
+                    <TableHead className="w-28" />
+                  </TableRow>
+                </TableHeader>
+                <StickyHoverTableBody>
+                  {sandboxes.map((sandbox) => (
+                    <SandboxTableRow
+                      key={sandbox.id}
+                      sandbox={sandbox}
+                      selected={selected.has(sandbox.id)}
+                      onToggle={() => toggleOne(sandbox.id)}
+                      onConnect={() => {
+                        posthog.capture(SANDBOX_EVENTS.CONNECT_OPENED, {
+                          sandbox_id: sandbox.id,
+                        })
+                        setConnectSandboxId(sandbox.id)
+                      }}
+                      onDelete={() =>
+                        setDeleteTarget({
+                          id: sandbox.id,
+                          name: sandbox.name,
+                        })
+                      }
+                      onPause={() => {
+                        posthog.capture(SANDBOX_EVENTS.PAUSED, {
+                          sandbox_id: sandbox.id,
+                        })
+                        pauseMutation.mutate(sandbox.id)
+                      }}
+                      onResume={() => {
+                        posthog.capture(SANDBOX_EVENTS.RESUMED, {
+                          sandbox_id: sandbox.id,
+                        })
+                        resumeMutation.mutate(sandbox.id)
+                      }}
+                      onOpenTerminal={() =>
+                        posthog.capture(SANDBOX_EVENTS.TERMINAL_OPENED, {
+                          sandbox_id: sandbox.id,
+                          source: "list_menu",
+                        })
+                      }
+                      onTakeSnapshot={() => setSnapshotTarget(sandbox.id)}
+                    />
+                  ))}
+                </StickyHoverTableBody>
+              </Table>
+            )}
+          </div>
+
+          {total > 0 && (
+            <Pagination
+              page={page}
+              pageSize={pageSize}
+              total={total}
+              onPageChange={setPage}
+              onPageSizeChange={setPageSize}
+            />
+          )}
+        </>
+      )}
+
+      {connectSandboxId && (
+        <ConnectSandboxDialog
+          sandboxId={connectSandboxId}
+          open={!!connectSandboxId}
+          onOpenChange={(v) => {
+            if (!v) setConnectSandboxId(null)
+          }}
+        />
+      )}
+
+      {snapshotTarget && (
+        <TakeSnapshotDialog
+          open={!!snapshotTarget}
+          onOpenChange={(v) => {
+            if (!v) setSnapshotTarget(null)
+          }}
+          sandboxId={snapshotTarget}
+        />
+      )}
+
+      {deleteTarget && (
+        <DeleteSandboxDialog
+          open={!!deleteTarget}
+          onOpenChange={(v) => {
+            if (!v) setDeleteTarget(null)
+          }}
+          sandboxName={deleteTarget.name}
+          onConfirm={() => {
+            posthog.capture(SANDBOX_EVENTS.DELETED, { id: deleteTarget.id })
+            return new Promise<void>((resolve, reject) => {
+              deleteSandbox.mutate(deleteTarget.id, {
+                onSuccess: () => {
+                  setDeleteTarget(null)
+                  resolve()
+                },
+                onError: reject,
+              })
+            })
+          }}
+        />
+      )}
+
+      <DeleteSandboxDialog
+        open={bulkDeleteOpen}
+        onOpenChange={setBulkDeleteOpen}
+        bulkCount={selected.size}
+        onConfirm={() => {
+          posthog.capture(SANDBOX_EVENTS.BULK_DELETED, {
+            count: selected.size,
+          })
+          return new Promise<void>((resolve, reject) => {
+            bulkDelete.mutate([...selected], {
+              onSuccess: () => {
+                clearSelection()
+                setBulkDeleteOpen(false)
+                resolve()
+              },
+              onError: reject,
+            })
+          })
+        }}
+      />
+    </div>
+  )
+}

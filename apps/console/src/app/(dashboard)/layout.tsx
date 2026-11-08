@@ -1,0 +1,61 @@
+import { redirect } from "next/navigation"
+
+import { AccountDeviceRecorder } from "@/components/account-device-recorder"
+import { ImpersonationBanner } from "@/components/admin/impersonation-banner"
+import { PlanBanner } from "@/components/billing/plan-banner"
+import { DashboardShell } from "@/components/layout/dashboard-shell"
+import { SessionExpiryRedirect } from "@/components/layout/session-expiry-redirect"
+import { PlanSelectionLoader } from "@/components/onboarding/plan-selection-loader"
+import { SignupPlanGate } from "@/components/onboarding/signup-plan-gate"
+import { QueryProvider } from "@/components/query-provider"
+import {
+  getImpersonationContext,
+  hasImpersonationCookie,
+} from "@/lib/admin/impersonation"
+import { needsPlanSelection } from "@/lib/api/signup-plan"
+import { getSignupPlanPage } from "@/lib/api/signup-plan-page"
+import { awaitingPlanRedirect } from "@/lib/billing/signup-checkout-paths"
+
+export default async function DashboardLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  const impersonationContext = (await hasImpersonationCookie())
+    ? await getImpersonationContext()
+    : null
+  const signup = impersonationContext ? null : await getSignupPlanPage()
+  if (!impersonationContext && !signup)
+    return <PlanSelectionLoader initialContext={null} />
+  if (signup && needsPlanSelection(signup.context)) redirect("/onboarding/plan")
+  const picker = signup ? awaitingPlanRedirect(signup.context) : null
+  if (picker) redirect(picker)
+  const queryScope = impersonationContext?.teamId ?? "self"
+
+  return (
+    <QueryProvider
+      cacheScope={queryScope}
+      initialSignup={signup ?? undefined}
+      teamContext={
+        impersonationContext
+          ? {
+              teamId: impersonationContext.teamId,
+              region: impersonationContext.region,
+              name: impersonationContext.teamName,
+            }
+          : null
+      }
+    >
+      <SessionExpiryRedirect />
+      {!impersonationContext && <AccountDeviceRecorder />}
+      <SignupPlanGate>
+        <DashboardShell
+          globalBanner={<PlanBanner />}
+          banner={<ImpersonationBanner context={impersonationContext} />}
+        >
+          {children}
+        </DashboardShell>
+      </SignupPlanGate>
+    </QueryProvider>
+  )
+}

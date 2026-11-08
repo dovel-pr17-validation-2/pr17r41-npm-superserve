@@ -1,0 +1,104 @@
+name: Release SDKs
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Which package to publish"
+        required: true
+        type: choice
+        options:
+          - ts
+          - python
+          - both
+      version:
+        description: "New version (semver, e.g. 0.2.1)"
+        required: true
+        type: string
+
+jobs:
+  release-ts:
+    if: ${{ inputs.package == 'ts' || inputs.package == 'both' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # npm Trusted Publishing (OIDC) + provenance
+      contents: write # push the version-bump commit + tag
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      # npm (not bun publish) for OIDC Trusted Publishing; needs npm >= 11.5.1.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "lts/*"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # Bump package.json + the User-Agent constant together (they must match).
+      - name: Bump version
+        run: |
+          cd packages/sdk
+          node -e "const fs=require('fs'); const p=require('./package.json'); p.version='${{ inputs.version }}'; fs.writeFileSync('./package.json', JSON.stringify(p, null, 2) + '\n');"
+          node -e "const fs=require('fs'); const f='./src/http.ts'; const s=fs.readFileSync(f,'utf8').replace(/const SDK_VERSION = \"[^\"]+\"/, 'const SDK_VERSION = \"${{ inputs.version }}\"'); fs.writeFileSync(f, s);"
+
+      - name: Build
+        run: bunx turbo run build --filter=@superserve/sdk
+
+      - name: Publish to npm (Trusted Publishing + provenance)
+        run: cd packages/sdk && npm publish --access public --provenance
+
+      # main is a protected branch (PR-only), so we push only the tag, never a
+      # commit. Bump the version on main via a PR before running this workflow.
+      - name: Tag release
+        run: |
+          git tag "@superserve/sdk@${{ inputs.version }}"
+          git push origin "@superserve/sdk@${{ inputs.version }}"
+
+  release-python:
+    if: ${{ inputs.package == 'python' || inputs.package == 'both' }}
+    runs-on: ubuntu-latest
+    # Must match the environment on the PyPI trusted publisher (OIDC claim).
+    environment: pypi
+    permissions:
+      id-token: write # PyPI Trusted Publishing (OIDC)
+      contents: write # push the release tag
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+
+      # Bump pyproject + __version__ + the User-Agent constant together (they
+      # must match).
+      - name: Bump version
+        run: |
+          cd packages/python-sdk
+          python3 -c "import re; p=open('pyproject.toml').read(); p=re.sub(r'version = \"[^\"]+\"', 'version = \"${{ inputs.version }}\"', p, count=1); open('pyproject.toml','w').write(p)"
+          python3 -c "import re; p=open('src/superserve/__init__.py').read(); p=re.sub(r'__version__ = \"[^\"]+\"', '__version__ = \"${{ inputs.version }}\"', p, count=1); open('src/superserve/__init__.py','w').write(p)"
+          python3 -c "import re; p=open('src/superserve/_http.py').read(); p=re.sub(r'SDK_VERSION = \"[^\"]+\"', 'SDK_VERSION = \"${{ inputs.version }}\"', p, count=1); open('src/superserve/_http.py','w').write(p)"
+
+      # uv workspace puts artifacts in the repo-root dist/.
+      - name: Build
+        run: uv build --package superserve
+
+      - name: Publish to PyPI (Trusted Publishing)
+        run: uv publish --trusted-publishing always dist/superserve-${{ inputs.version }}*
+
+      # main is a protected branch (PR-only), so we push only the tag, never a
+      # commit. Bump the version on main via a PR before running this workflow.
+      - name: Tag release
+        run: |
+          git tag "superserve-py@${{ inputs.version }}"
+          git push origin "superserve-py@${{ inputs.version }}"

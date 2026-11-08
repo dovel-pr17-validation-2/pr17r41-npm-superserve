@@ -1,0 +1,802 @@
+"""Sync Sandbox class — primary entry point for the Superserve Python SDK."""
+
+from __future__ import annotations
+
+import builtins
+import threading
+import time
+from typing import TYPE_CHECKING, Any, Sequence
+from urllib.parse import quote, urlencode
+
+import httpx
+
+from ._config import ResolvedConfig, preview_url, resolve_config
+from ._routing_hint import routing_hint_expired
+from ._http import (
+    DEFAULT_PAUSE_TIMEOUT,
+    DeadlineExceeded,
+    api_request,
+    pause_poll_delay,
+    PAUSE_FAST_POLL_WINDOW_S,
+    shared_client,
+    ACTIVATE_PAUSING_RETRY_S,
+    ACTIVATE_PAUSING_WAIT_S,
+    DEFAULT_PAUSE_POLL_S,
+)
+from .commands import Commands, CommandsDeps
+from .desktop import DESKTOP_STREAM_PORT, Desktop, DesktopDeps
+from .errors import ConflictError, NotFoundError, SandboxError, SandboxTimeoutError
+from .snapshots import (
+    DEFAULT_SNAPSHOT_POLL_S,
+    DEFAULT_SNAPSHOT_TIMEOUT,
+    Snapshot,
+    _snapshot_create_body,
+)
+from .files import Files, FilesDeps
+from .types import (
+    UNSET,
+    build_update_body,
+    list_query,
+    NetworkConfig,
+    NetworkLogPage,
+    NetworkVerdict,
+    PreviewAccess,
+    PreviewAccessPolicy,
+    PreviewPortList,
+    PreviewToken,
+    PublishedPreviewPort,
+    SandboxInfo,
+    SandboxSecretBinding,
+    SandboxStatus,
+    SnapshotInfo,
+    SnapshotKind,
+    to_network_log_page,
+    to_sandbox_info,
+    to_snapshot_info,
+)
+
+if TYPE_CHECKING:
+    from .async_snapshots import AsyncSnapshot
+    from .async_template import AsyncTemplate
+    from .template import Template
+
+
+class Sandbox:
+    """A sandbox handle - call methods directly (`sandbox.commands.run(...)`, etc.)."""
+
+    def __init__(
+        self,
+        info: SandboxInfo,
+        access_token: str,
+        config: ResolvedConfig,
+        routing_hint: str | None = None,
+    ) -> None:
+        self.id: str = info.id
+        self.name: str = info.name
+        self.status: SandboxStatus = info.status
+        self.metadata: dict[str, str] = info.metadata
+        self.preview_access: PreviewAccess = info.preview_access
+        # Secrets bound at construction time; call get_info() to refresh.
+        self.secrets: list[SandboxSecretBinding] | None = info.secrets
+        self._access_token: str = access_token
+        self._routing_hint = routing_hint
+        self._route_revision = 0
+        self._applied_route_revision = 0
+        self._config = config
+        self._closed = False
+        self._refresh_lock = threading.Lock()
+
+        self.commands = Commands(
+            CommandsDeps(
+                sandbox_id=self.id,
+                sandbox_host=config.sandbox_host,
+                get_access_token=lambda: self._access_token,
+                get_routing_hint=lambda: self._routing_hint,
+                refresh_activate=self._refresh_activate,
+                refresh_expired_hint=self._refresh_expired_hint,
+            ),
+        )
+        self.files = Files(
+            FilesDeps(
+                sandbox_id=self.id,
+                sandbox_host=config.sandbox_host,
+                get_access_token=lambda: self._access_token,
+                get_routing_hint=lambda: self._routing_hint,
+                refresh_activate=self._refresh_activate,
+                refresh_expired_hint=self._refresh_expired_hint,
+            ),
+        )
+
+        def _publish_stream_port() -> PreviewAccessPolicy:
+            return self.publish_preview_port(DESKTOP_STREAM_PORT).access
+
+        self.desktop = Desktop(
+            DesktopDeps(
+                sandbox_id=self.id,
+                sandbox_host=config.sandbox_host,
+                get_access_token=lambda: self._access_token,
+                get_routing_hint=lambda: self._routing_hint,
+                refresh_activate=self._refresh_activate,
+                refresh_expired_hint=self._refresh_expired_hint,
+                publish_stream_port=_publish_stream_port,
+                stream_base_url=lambda: self.get_preview_url(DESKTOP_STREAM_PORT),
+                mint_stream_token=lambda: self.get_preview_token(
+                    DESKTOP_STREAM_PORT, expires_in_seconds=60
+                ),
+            ),
+            # No client: resolved per call, so a process forked after this
+            # handle was created uses its own pool, as commands and files do.
+        )
+
+    def _post_and_rotate_token(self, endpoint: str) -> str:
+        """POST a token-rotating endpoint (``resume`` or ``activate``) and
+        update the cached token. ``commands`` and ``files`` read the token
+        live, so they pick up the rotation. Returns the new token.
+        """
+        self._route_revision += 1
+        revision = self._route_revision
+        raw = api_request(
+            "POST",
+            f"{self._config.base_url}/sandboxes/{self.id}/{endpoint}",
+            headers={"X-API-Key": self._config.api_key},
+            client=self._http_client,
+        )
+        token = raw.get("access_token") if raw else None
+        if not isinstance(token, str) or not token:
+            raise SandboxError(
+                f"Invalid API response from POST /sandboxes/{self.id}/{endpoint}: "
+                "missing access_token"
+            )
+        if revision > self._applied_route_revision:
+            self._applied_route_revision = revision
+            self._access_token = token
+            self._routing_hint = raw.get("routing_hint")
+        return self._access_token
+
+    def _refresh_activate(self) -> str:
+        """Slow-path fallback for data-plane AuthenticationError. Lock
+        serializes refreshes so concurrent callers don't race the
+        server-side BeginResume claim (the loser gets 409).
+        """
+        revision = self._applied_route_revision
+        with self._refresh_lock:
+            if revision != self._applied_route_revision:
+                return self._access_token
+            return self._post_and_rotate_token("activate")
+
+    def _refresh_expired_hint(self) -> str:
+        with self._refresh_lock:
+            if routing_hint_expired(lambda: self._routing_hint):
+                return self._post_and_rotate_token("activate")
+            return self._access_token
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        name: str,
+        from_template: "str | Template | AsyncTemplate | None" = None,
+        from_snapshot: "str | Snapshot | AsyncSnapshot | None" = None,
+        timeout_seconds: int | None = None,
+        idle_timeout_seconds: int | None = None,
+        auto_delete_seconds: int | None = None,
+        metadata: dict[str, str] | None = None,
+        env_vars: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
+        network: NetworkConfig | None = None,
+        preview_access: PreviewAccessPolicy | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> Sandbox:
+        """Create a new sandbox. Returns once the sandbox is ready.
+
+        ``secrets`` binds team-stored secrets to environment variables as
+        ``{ENV_VAR: secret_name}``: the agent sees a proxy token under each env
+        var; the in-host daemon swaps it for the real credential at egress.
+
+        ``idle_timeout_seconds`` (60 to 604800) pauses the sandbox after that
+        many seconds with no activity: running commands, open terminals and
+        command streams, file operations and preview traffic all count as
+        activity. Off when omitted.
+        """
+        config = resolve_config(api_key=api_key, base_url=base_url)
+
+        body: dict[str, Any] = {"name": name}
+        if from_template is not None:
+            if isinstance(from_template, str):
+                body["from_template"] = from_template
+            else:
+                # Template / AsyncTemplate instance — extract name (fallback to id)
+                body["from_template"] = (
+                    getattr(from_template, "name", None) or from_template.id
+                )
+        if from_snapshot is not None:
+            body["from_snapshot"] = (
+                from_snapshot if isinstance(from_snapshot, str) else from_snapshot.id
+            )
+        if timeout_seconds is not None:
+            body["timeout_seconds"] = timeout_seconds
+        if idle_timeout_seconds is not None:
+            body["idle_timeout_seconds"] = idle_timeout_seconds
+        if auto_delete_seconds is not None:
+            body["auto_delete_seconds"] = auto_delete_seconds
+        if metadata is not None:
+            body["metadata"] = metadata
+        if env_vars is not None:
+            body["env_vars"] = env_vars
+        if secrets is not None:
+            body["secrets"] = secrets
+        if network:
+            body["network"] = {
+                "allow_out": network.allow_out,
+                "deny_out": network.deny_out,
+            }
+        if preview_access is not None:
+            body["preview_access"] = preview_access
+
+        raw = api_request(
+            "POST",
+            f"{config.base_url}/sandboxes",
+            headers={"X-API-Key": config.api_key},
+            json_body=body,
+        )
+        token = raw.get("access_token") if raw else None
+        if not token:
+            raise SandboxError(
+                "Invalid API response from POST /sandboxes: missing access_token"
+            )
+        return cls(to_sandbox_info(raw), token, config, raw.get("routing_hint"))
+
+    @classmethod
+    def connect(
+        cls,
+        sandbox_id: str,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> Sandbox:
+        """Connect to an existing sandbox by ID.
+
+        Calls ``POST /activate`` so the returned instance is guaranteed to
+        be active (paused sandboxes are auto-resumed) with a fresh access
+        token.
+        """
+        config = resolve_config(api_key=api_key, base_url=base_url)
+        # A pause still finishing is waited out by the server; past its own
+        # wait it answers sandbox_pausing, and the pause lands shortly after.
+        # No retry starts without a second of the window left, so connect never
+        # runs much past it.
+        deadline = time.monotonic() + ACTIVATE_PAUSING_WAIT_S
+        while True:
+            try:
+                raw = api_request(
+                    "POST",
+                    f"{config.base_url}/sandboxes/{sandbox_id}/activate",
+                    headers={"X-API-Key": config.api_key},
+                )
+                break
+            except ConflictError as exc:
+                if (
+                    exc.code != "sandbox_pausing"
+                    or deadline - time.monotonic() <= ACTIVATE_PAUSING_RETRY_S
+                ):
+                    raise
+                time.sleep(ACTIVATE_PAUSING_RETRY_S)
+        token = raw.get("access_token") if raw else None
+        if not token:
+            raise SandboxError(
+                f"Invalid API response from POST /sandboxes/{sandbox_id}/activate: "
+                "missing access_token"
+            )
+        return cls(to_sandbox_info(raw), token, config, raw.get("routing_hint"))
+
+    @classmethod
+    def list(
+        cls,
+        *,
+        metadata: dict[str, str] | None = None,
+        status: str | Sequence[str] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> builtins.list[SandboxInfo]:
+        """List sandboxes belonging to the authenticated team.
+
+        Optional filters: ``metadata`` (AND semantics), ``status`` (one status
+        or a nonempty list matching any selected status), and
+        ``limit``/``offset`` paging. Without ``limit`` the full list is
+        returned.
+        """
+        config = resolve_config(api_key=api_key, base_url=base_url)
+        url = f"{config.base_url}/sandboxes"
+        query = list_query(metadata, status, limit, offset)
+        if query:
+            url += f"?{query}"
+
+        raw = api_request("GET", url, headers={"X-API-Key": config.api_key})
+        return [to_sandbox_info(item) for item in raw]
+
+    @classmethod
+    def kill_by_id(
+        cls,
+        sandbox_id: str,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        """Delete a sandbox by ID. Idempotent."""
+        config = resolve_config(api_key=api_key, base_url=base_url)
+        try:
+            api_request(
+                "DELETE",
+                f"{config.base_url}/sandboxes/{sandbox_id}",
+                headers={"X-API-Key": config.api_key},
+                retry_conflict=True,
+            )
+        except NotFoundError:
+            pass  # Already deleted
+
+    @classmethod
+    def update_by_id(
+        cls,
+        sandbox_id: str,
+        *,
+        metadata: dict[str, str] | None = None,
+        network: NetworkConfig | None = None,
+        auto_delete_seconds: int | None = UNSET,
+        timeout_seconds: int | None = UNSET,
+        idle_timeout_seconds: int | None = UNSET,
+        preview_access: PreviewAccessPolicy | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        """Update a sandbox by ID without holding a live instance.
+
+        Unlike ``connect(id).update(...)`` this does not activate the sandbox —
+        a paused sandbox stays paused. Pass ``None`` for ``auto_delete_seconds``,
+        ``timeout_seconds`` or ``idle_timeout_seconds`` to clear them; omit to
+        leave unchanged.
+        """
+        config = resolve_config(api_key=api_key, base_url=base_url)
+        api_request(
+            "PATCH",
+            f"{config.base_url}/sandboxes/{sandbox_id}",
+            headers={"X-API-Key": config.api_key},
+            json_body=build_update_body(
+                metadata=metadata,
+                network=network,
+                auto_delete_seconds=auto_delete_seconds,
+                timeout_seconds=timeout_seconds,
+                idle_timeout_seconds=idle_timeout_seconds,
+                preview_access=preview_access,
+            ),
+        )
+
+    # Methods on sandbox
+
+    @property
+    def _http_client(self) -> httpx.Client:
+        return shared_client()
+
+    def _close_http_client(self) -> None:
+        self._closed = True
+
+    def _require_not_deleted(self) -> None:
+        """Reject calls on a deleted handle without requiring an active VM."""
+        if self._closed:
+            raise SandboxError(
+                f"Sandbox {self.id!r} has been deleted; create or connect to a new one."
+            )
+
+    def get_info(self) -> SandboxInfo:
+        """Refresh this sandbox's info from the API."""
+        self._require_not_deleted()
+        raw = api_request(
+            "GET",
+            f"{self._config.base_url}/sandboxes/{self.id}",
+            headers={"X-API-Key": self._config.api_key},
+            client=self._http_client,
+        )
+        return to_sandbox_info(raw)
+
+    def snapshot(
+        self,
+        *,
+        name: str | None = None,
+        kind: SnapshotKind = "mem+fs",
+        idempotency_key: str | None = None,
+        wait: bool = True,
+        timeout: float = DEFAULT_SNAPSHOT_TIMEOUT,
+        poll_interval_s: float = DEFAULT_SNAPSHOT_POLL_S,
+    ) -> Snapshot:
+        """Take a snapshot of this sandbox's memory and disk, kept until deleted.
+
+        A running sandbox is paused for the capture and resumed after. Create
+        sandboxes from it with ``Sandbox.create(from_snapshot=...)``; they continue
+        with the processes that were running. ``timeout`` covers capture and
+        wait together.
+        """
+        self._require_not_deleted()
+        started = time.monotonic()
+        raw = api_request(
+            "POST",
+            f"{self._config.base_url}/sandboxes/{self.id}/snapshot",
+            headers={"X-API-Key": self._config.api_key},
+            json_body=_snapshot_create_body(kind, name, idempotency_key),
+            timeout=timeout,
+            budget=timeout,
+            client=self._http_client,
+        )
+        snapshot = Snapshot(to_snapshot_info(raw), self._config)
+        if not wait:
+            return snapshot
+        # A 202 answer is still creating; the platform settles it shortly.
+        return snapshot.wait_until_ready(
+            timeout=max(timeout - (time.monotonic() - started), 0.0),
+            poll_interval_s=poll_interval_s,
+        )
+
+    def snapshots(
+        self, *, limit: int | None = None, offset: int | None = None
+    ) -> builtins.list[SnapshotInfo]:
+        """This sandbox's snapshots, newest first."""
+        return Snapshot.list(
+            self.id,
+            limit=limit,
+            offset=offset,
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+        )
+
+    def get_preview_url(self, port: int) -> str:
+        """Build the preview URL for a port running inside this sandbox.
+
+        This is pure string construction. Under strict public/private policies,
+        publish the port first; private URLs also need a header token or a
+        signed URL from :meth:`get_signed_preview_url`.
+
+        Raises:
+            ValidationError: if ``port`` is not an integer in [1024, 65535].
+        """
+        return preview_url(self.id, self._config.sandbox_host, port)
+
+    def list_preview_ports(self) -> PreviewPortList:
+        """Return the sandbox default and each published port's access mode."""
+        self._require_not_deleted()
+        raw = api_request(
+            "GET",
+            f"{self._config.base_url}/sandboxes/{self.id}/preview-ports",
+            headers={"X-API-Key": self._config.api_key},
+            client=self._http_client,
+        )
+        return PreviewPortList(
+            preview_access=PreviewAccess(raw.get("preview_access", "legacy_public")),
+            ports=[PublishedPreviewPort(**p) for p in raw.get("ports", [])],
+        )
+
+    def publish_preview_port(
+        self, port: int, *, access: PreviewAccessPolicy | None = None
+    ) -> PublishedPreviewPort:
+        """Publish a port, optionally overriding its public/private access mode.
+
+        Omitting ``access`` uses the sandbox default for a new port and preserves
+        the current mode when the port is already published.
+        """
+        self._require_not_deleted()
+        self.get_preview_url(port)
+        body: dict[str, object] = {"port": port}
+        if access is not None:
+            body["access"] = access
+        raw = api_request(
+            "POST",
+            f"{self._config.base_url}/sandboxes/{self.id}/preview-ports",
+            headers={"X-API-Key": self._config.api_key},
+            json_body=body,
+            client=self._http_client,
+        )
+        return PublishedPreviewPort(**raw)
+
+    def unpublish_preview_port(self, port: int) -> None:
+        """Unpublish a port and revoke its outstanding tokens."""
+        self._require_not_deleted()
+        self.get_preview_url(port)
+        api_request(
+            "DELETE",
+            f"{self._config.base_url}/sandboxes/{self.id}/preview-ports/{port}",
+            headers={"X-API-Key": self._config.api_key},
+            client=self._http_client,
+        )
+
+    def get_preview_token(
+        self, port: int, *, expires_in_seconds: int | None = None
+    ) -> PreviewToken:
+        """Mint a header/query credential for an already-published port."""
+        self._require_not_deleted()
+        self.get_preview_url(port)
+        body = (
+            {}
+            if expires_in_seconds is None
+            else {"expires_in_seconds": expires_in_seconds}
+        )
+        raw = api_request(
+            "POST",
+            f"{self._config.base_url}/sandboxes/{self.id}/preview-ports/{port}/token",
+            headers={"X-API-Key": self._config.api_key},
+            json_body=body,
+            client=self._http_client,
+        )
+        return PreviewToken(**raw)
+
+    def get_signed_preview_url(self, port: int, *, expires_in_seconds: int = 60) -> str:
+        """Return a browser URL that bootstraps a secure preview cookie."""
+        credential = self.get_preview_token(port, expires_in_seconds=expires_in_seconds)
+        return f"{self.get_preview_url(port)}?{urlencode({credential.query_param: credential.token})}"
+
+    def rotate_preview_token(self, port: int) -> PreviewToken:
+        """Rotate this port's token generation and return a fresh token."""
+        self._require_not_deleted()
+        self.get_preview_url(port)
+        raw = api_request(
+            "POST",
+            f"{self._config.base_url}/sandboxes/{self.id}/preview-ports/{port}/token/rotate",
+            headers={"X-API-Key": self._config.api_key},
+            client=self._http_client,
+        )
+        return PreviewToken(**raw)
+
+    def pause(
+        self,
+        *,
+        wait: bool = False,
+        timeout: float = DEFAULT_PAUSE_TIMEOUT,
+        poll_interval_s: float | None = None,
+    ) -> None:
+        """Pause this sandbox. The sandbox transitions to ``paused``.
+
+        Returns once the pause is accepted; with ``wait=True`` it returns once
+        the sandbox is ``paused``.
+        """
+        self._require_not_deleted()
+        deadline = time.monotonic() + timeout
+        # A waited pause is one request the server holds until the pause
+        # lands; an unwaited one asks for the acceptance alone.
+        headers = {"X-API-Key": self._config.api_key}
+        if not wait:
+            headers["Prefer"] = "respond-async"
+        try:
+            raw = api_request(
+                "POST",
+                f"{self._config.base_url}/sandboxes/{self.id}/pause",
+                headers=headers,
+                budget=timeout if wait else None,
+                client=self._http_client,
+            )
+        except DeadlineExceeded as exc:
+            raise self._still_pausing(timeout) from exc
+        except SandboxTimeoutError:
+            # Without waiting there is no way to tell whether the pause was
+            # accepted; only a waiting call follows it through the status.
+            if not wait:
+                raise
+            raw = {"status": "pausing"}
+        # A 204 means the pause completed. Only one the server stopped waiting
+        # for is followed through the status, at the slow cadence: it has
+        # already run long.
+        if wait and isinstance(raw, dict) and raw.get("status") == "pausing":
+            self._wait_until_paused(
+                deadline,
+                timeout,
+                DEFAULT_PAUSE_POLL_S if poll_interval_s is None else poll_interval_s,
+            )
+
+    def _wait_until_paused(
+        self, deadline: float, timeout: float, poll_interval_s: float | None
+    ) -> None:
+        """Poll until the sandbox is ``paused``. A sandbox deleted meanwhile
+        (delete on pause) counts as done; ``failed`` raises."""
+        headers = {"X-API-Key": self._config.api_key}
+        started = time.monotonic()
+        first = True
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self._still_pausing(timeout)
+            # Most pauses finish within a second or two: check at once, then
+            # closely for a short while, then at the caller's interval.
+            if not first:
+                time.sleep(
+                    min(
+                        pause_poll_delay(time.monotonic() - started, poll_interval_s),
+                        remaining,
+                    )
+                )
+            first = False
+            try:
+                raw = api_request(
+                    "GET",
+                    f"{self._config.base_url}/sandboxes/{self.id}",
+                    headers=headers,
+                    budget=deadline - time.monotonic(),
+                    client=self._http_client,
+                )
+            except DeadlineExceeded as exc:
+                raise self._still_pausing(timeout) from exc
+            except NotFoundError:
+                return
+            except SandboxTimeoutError:
+                # One slow poll; the deadline decides whether to keep going.
+                continue
+            status = to_sandbox_info(raw).status
+            if status in (SandboxStatus.PAUSED, SandboxStatus.DELETED):
+                return
+            # A request that timed out may be accepted only after this first
+            # look; 'active' this early is not yet an answer.
+            if (
+                status == SandboxStatus.ACTIVE
+                and time.monotonic() - started < PAUSE_FAST_POLL_WINDOW_S
+            ):
+                continue
+            if status != SandboxStatus.PAUSING:
+                raise SandboxError(
+                    f"Sandbox {self.id} did not pause: status is {SandboxStatus(status).value}"
+                )
+
+    def _still_pausing(self, timeout: float) -> SandboxTimeoutError:
+        return SandboxTimeoutError(
+            f"Sandbox {self.id} is still pausing after {timeout}s; it will finish in the background"
+        )
+
+    def resume(
+        self,
+        *,
+        timeout: float = DEFAULT_PAUSE_TIMEOUT,
+        poll_interval_s: float | None = None,
+    ) -> None:
+        """Resume a paused sandbox.
+
+        A pause still in progress is waited out first. The access token is
+        rotated; ``sandbox.commands`` and ``sandbox.files`` pick up the fresh
+        token transparently.
+        """
+        self._require_not_deleted()
+        try:
+            self._post_and_rotate_token("resume")
+        except ConflictError:
+            # A pause that finished between the two requests reads as paused here.
+            status = self.get_info().status
+            if status not in (SandboxStatus.PAUSING, SandboxStatus.PAUSED):
+                raise
+            if status == SandboxStatus.PAUSING:
+                self._wait_until_paused(
+                    time.monotonic() + timeout, timeout, poll_interval_s
+                )
+            self._post_and_rotate_token("resume")
+
+    def kill(self) -> None:
+        """Delete this sandbox and all its resources. Idempotent."""
+        if self._closed:
+            return
+        try:
+            api_request(
+                "DELETE",
+                f"{self._config.base_url}/sandboxes/{self.id}",
+                headers={"X-API-Key": self._config.api_key},
+                client=self._http_client,
+                retry_conflict=True,
+            )
+        except NotFoundError:
+            pass  # Already deleted
+        finally:
+            self._close_http_client()
+
+    def update(
+        self,
+        *,
+        metadata: dict[str, str] | None = None,
+        network: NetworkConfig | None = None,
+        auto_delete_seconds: int | None = UNSET,
+        timeout_seconds: int | None = UNSET,
+        idle_timeout_seconds: int | None = UNSET,
+        preview_access: PreviewAccessPolicy | None = None,
+    ) -> None:
+        """Partially update this sandbox.
+
+        ``auto_delete_seconds`` sets the auto-delete window (counting from now
+        when the sandbox is already paused); pass ``None`` to disable
+        auto-delete. ``timeout_seconds`` sets the auto-pause timeout; pass
+        ``None`` to disable auto-pause. ``idle_timeout_seconds`` pauses the
+        sandbox after that many seconds with no activity; pass ``None`` to turn
+        it off. Omit any of them to leave it unchanged.
+        """
+        self._require_not_deleted()
+        body = build_update_body(
+            metadata=metadata,
+            network=network,
+            auto_delete_seconds=auto_delete_seconds,
+            timeout_seconds=timeout_seconds,
+            idle_timeout_seconds=idle_timeout_seconds,
+            preview_access=preview_access,
+        )
+
+        api_request(
+            "PATCH",
+            f"{self._config.base_url}/sandboxes/{self.id}",
+            headers={"X-API-Key": self._config.api_key},
+            json_body=body,
+            client=self._http_client,
+        )
+
+    def get_network_log(
+        self,
+        *,
+        limit: int | None = None,
+        before: str | None = None,
+        since: str | None = None,
+        verdict: "NetworkVerdict | str | None" = None,
+    ) -> NetworkLogPage:
+        """The sandbox's network log: every outbound connection it made, newest
+        first. ``connection`` rows are raw egress (host, bytes, allow/deny
+        verdict); ``request`` rows are credential-injected requests (method,
+        path, status, secret used).
+
+        Filter by time window (``since``/``before``) and ``verdict``. Paginate
+        by passing the returned ``next_cursor`` as ``before`` while ``has_more``.
+        """
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if before is not None:
+            params["before"] = before
+        if since is not None:
+            params["since"] = since
+        if verdict is not None:
+            params["verdict"] = (
+                verdict.value if isinstance(verdict, NetworkVerdict) else verdict
+            )
+        url = f"{self._config.base_url}/sandboxes/{self.id}/network"
+        if params:
+            url += "?" + urlencode(params)
+        raw = api_request(
+            "GET",
+            url,
+            headers={"X-API-Key": self._config.api_key},
+            client=self._http_client,
+        )
+        return to_network_log_page(raw)
+
+    def attach_secret(self, env_key: str, secret_name: str) -> None:
+        """Bind a team secret to this sandbox under an environment variable.
+
+        The sandbox sees a stand-in token; the real credential is swapped in for
+        outbound requests to the secret's allowed hosts. Takes effect for
+        processes started after this call; a paused sandbox applies it on resume.
+        """
+        self._require_not_deleted()
+        api_request(
+            "POST",
+            f"{self._config.base_url}/sandboxes/{self.id}/secrets",
+            headers={"X-API-Key": self._config.api_key},
+            json_body={"env_key": env_key, "secret_name": secret_name},
+            client=self._http_client,
+        )
+
+    def detach_secret(self, env_key: str) -> None:
+        """Remove a secret binding from this sandbox by its env-var key.
+
+        The stand-in token is revoked, so requests using it are refused — within
+        about a minute for a process already running. A paused sandbox applies
+        the change on resume.
+        """
+        self._require_not_deleted()
+        api_request(
+            "DELETE",
+            f"{self._config.base_url}/sandboxes/{self.id}/secrets/{quote(env_key, safe='')}",
+            headers={"X-API-Key": self._config.api_key},
+            client=self._http_client,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"Sandbox(id={self.id!r}, name={self.name!r}, status={self.status.value!r})"
+        )

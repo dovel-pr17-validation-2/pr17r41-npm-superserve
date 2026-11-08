@@ -1,0 +1,70 @@
+---
+title: "Kilo Code"
+sidebarTitle: Kilo Code
+description: Run Kilo Code in a Superserve sandbox.
+icon: "/logos/integrations/kilocode.svg"
+---
+
+Pair Kilo Code with a Superserve sandbox to run its generated commands and file edits in an isolated VM.
+
+## Via the console
+
+1. On the [Secrets page](https://console.superserve.ai/secrets?utm_source=docs&utm_medium=link), create a secret for your model provider (e.g. **Anthropic**) and paste your API key — you only do this once, and the key never enters the sandbox.
+2. Go to [console.superserve.ai](https://console.superserve.ai?utm_source=docs&utm_medium=link) and click **Create sandbox**.
+3. Pick the **`superserve/node-22`** template.
+4. Under **Advanced Options → Secrets**, bind that secret to your provider's key env var (e.g. `ANTHROPIC_API_KEY`).
+5. Create the sandbox, open its **Terminal**, and install Kilo Code.
+
+## Via the SDK
+
+```bash
+npm install @superserve/sdk
+export SUPERSERVE_API_KEY=ss_live_...
+```
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox, Secret } from "@superserve/sdk"
+
+// One-time: store your key as a secret. It never enters the sandbox.
+await Secret.create({
+  name: "anthropic-key",
+  value: "sk-ant-...",
+  provider: "anthropic",
+})
+
+const sandbox = await Sandbox.create({
+  name: "kilocode",
+  fromTemplate: "superserve/node-22",
+  secrets: { ANTHROPIC_API_KEY: "anthropic-key" },
+})
+
+await sandbox.commands.run("npm install -g @kilocode/cli")
+```
+
+```python Python
+from superserve import Sandbox, Secret
+
+# One-time: store your key as a secret. It never enters the sandbox.
+Secret.create(name="anthropic-key", value="sk-ant-...", provider="anthropic")
+
+sandbox = Sandbox.create(
+    name="kilocode",
+    from_template="superserve/node-22",
+    secrets={"ANTHROPIC_API_KEY": "anthropic-key"},
+)
+
+sandbox.commands.run("npm install -g @kilocode/cli")
+```
+</CodeGroup>
+
+Kilo Code reads `ANTHROPIC_API_KEY` as usual, but its value is a [stand-in token](/secrets/overview) — the real key is attached only on requests to the provider, never exposed to the agent.
+
+Open the sandbox in the [console](https://console.superserve.ai?utm_source=docs&utm_medium=link), launch the terminal, and run `kilocode`.
+
+## Persist sessions
+
+```typescript
+await sandbox.pause()
+await sandbox.resume()
+```

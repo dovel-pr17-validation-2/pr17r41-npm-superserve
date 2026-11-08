@@ -1,0 +1,209 @@
+"""Connection configuration for the Superserve Python SDK."""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+from .errors import AuthenticationError, ValidationError
+
+DEFAULT_BASE_URL = "https://api.superserve.ai"
+DEFAULT_SANDBOX_HOST = "sandbox.superserve.ai"
+
+# Known Superserve regions, keyed by the region token embedded in API keys
+# (``ss_live_<region>_<random>``) and mapped to (base URL, sandbox host).
+#
+# A region may be listed here only once its endpoints ACTUALLY SERVE THE
+# API — DNS resolving is not the bar: superserve.ai has a catch-all wildcard,
+# so every derived hostname resolves and answers with a valid-TLS 404 from
+# the wrong infrastructure. Verify with a live /health check, not dig.
+# ``usw`` was added once https://api-usw.superserve.ai /
+# usw-sandbox.superserve.ai served their cell end-to-end.
+#
+# Legacy keys (``ss_live_<random>``) can never be misread as region-tagged:
+# both key formats embed the same fixed-length 32-char base64url random tail
+# (from 24 random bytes), and ``_REGION_KEY_RE`` requires that exact tail
+# length anchored to the end of the string. A legacy key has no room left
+# over for a region segment on top of its own 32-char tail, so no random
+# legacy key can ever collide with a real region token — this holds
+# regardless of how many regions ``_KNOWN_REGIONS`` ends up containing.
+_KNOWN_REGIONS: dict[str, tuple[str, str]] = {
+    "use": ("https://api.superserve.ai", "sandbox.superserve.ai"),
+    "usw": ("https://api-usw.superserve.ai", "usw-sandbox.superserve.ai"),
+}
+
+# Region token in ``ss_live_<region>_<random>``: 1-17 lowercase alphanumeric
+# chars, then ``_``, then exactly the 32-char base64url tail every key is
+# minted with — anchored to the end so a legacy key's own tail can never be
+# mistaken for ``<region>_<tail>``.
+_REGION_KEY_RE = re.compile(r"^ss_live_([a-z0-9]{1,17})_[A-Za-z0-9_-]{32}$")
+
+
+@dataclass(frozen=True)
+class ResolvedConfig:
+    api_key: str
+    base_url: str
+    sandbox_host: str
+
+
+def resolve_config(
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> ResolvedConfig:
+    """Resolve connection config from explicit args + environment variables.
+
+    Base URL precedence: explicit ``base_url`` > ``SUPERSERVE_BASE_URL`` env
+    var > region derived from the API key > ``DEFAULT_BASE_URL``. The sandbox
+    host follows the same source (derived from the override URL, or taken
+    from the region map).
+    """
+    resolved_key = api_key or os.environ.get("SUPERSERVE_API_KEY")
+    if not resolved_key:
+        raise AuthenticationError(
+            "Missing API key. Pass `api_key` or set the "
+            "SUPERSERVE_API_KEY environment variable."
+        )
+    # A set-but-empty/whitespace override (SUPERSERVE_BASE_URL="" or "  ") is
+    # treated as unset, so it falls through to region derivation instead of
+    # becoming a broken empty base URL / silently bypassing region derivation
+    # for a region-tagged key.
+    _override = base_url or os.environ.get("SUPERSERVE_BASE_URL")
+    resolved_url = _override.strip() if _override and _override.strip() else None
+    if resolved_url is not None:
+        sandbox_host = _derive_sandbox_host(resolved_url)
+    else:
+        region = _region_from_api_key(resolved_key)
+        endpoints = _KNOWN_REGIONS.get(region) if region else None
+        if endpoints is not None:
+            resolved_url, sandbox_host = endpoints
+        else:
+            resolved_url = DEFAULT_BASE_URL
+            sandbox_host = DEFAULT_SANDBOX_HOST
+    return ResolvedConfig(
+        api_key=resolved_key,
+        base_url=resolved_url,
+        sandbox_host=sandbox_host,
+    )
+
+
+# Sandbox hosts where the proxy supports shared-host routing (shared origin +
+# X-Superserve-Sandbox-Id, server-side only). ``usw-sandbox.superserve.ai`` is
+_SUPPORTED_SHARED_HOSTS: frozenset[str] = frozenset(
+    {
+        "sandbox.superserve.ai",
+        "staging-sandbox.superserve.ai",
+        "usw-sandbox.superserve.ai",
+    }
+)
+
+_SANDBOX_ID_HEADER = "X-Superserve-Sandbox-Id"
+
+
+@dataclass(frozen=True)
+class DataPlaneTarget:
+    """Base URL + routing headers for one data-plane request."""
+
+    url: str
+    headers: dict[str, str]
+
+
+def data_plane_target(sandbox_id: str, sandbox_host: str) -> DataPlaneTarget:
+    """Resolve the data-plane base URL + routing headers for a sandbox.
+
+    On a supported host, routes via the shared origin with
+    X-Superserve-Sandbox-Id. Unsupported hosts fall back to the
+    per-sandbox subdomain.
+    """
+    host = sandbox_host.lower()
+    if host in _SUPPORTED_SHARED_HOSTS:
+        return DataPlaneTarget(
+            url=f"https://{host}",
+            headers={_SANDBOX_ID_HEADER: sandbox_id},
+        )
+    return DataPlaneTarget(
+        url=f"https://boxd-{sandbox_id}.{host}",
+        headers={},
+    )
+
+
+# Lowest / highest TCP port a preview URL can target. Privileged ports
+# (< 1024) and boxd's control-plane port are refused by the edge proxy, so we
+# reject them up front.
+#
+# Mirrored by the TypeScript SDK (packages/sdk/src/config.ts) and the console
+# (apps/console/src/hooks/use-preview-ports.ts); keep all three in sync. Tests
+# pin the literals on each side so one-sided drift fails CI.
+MIN_PREVIEW_PORT = 1024
+MAX_PREVIEW_PORT = 65535
+RESERVED_PREVIEW_PORT = 49983
+
+
+def preview_url(sandbox_id: str, host: str, port: int) -> str:
+    """Build the preview URL for a port running inside a sandbox.
+
+    This is pure string construction — no network call. Under strict policies,
+    the port must be published first; private previews also require a token.
+
+    Always uses the per-sandbox subdomain form (never the shared-host mode):
+    a browser opening the URL can't send the ``X-Superserve-Sandbox-Id``
+    header.
+
+    Raises:
+        ValidationError: if ``port`` is not an integer in [1024, 65535] or is
+            the reserved boxd control-plane port (49983).
+    """
+    if (
+        not isinstance(port, int)
+        or isinstance(port, bool)
+        or port < MIN_PREVIEW_PORT
+        or port > MAX_PREVIEW_PORT
+        or port == RESERVED_PREVIEW_PORT
+    ):
+        if port == RESERVED_PREVIEW_PORT:
+            raise ValidationError(
+                f"Invalid preview port {port!r}: reserved for sandbox control traffic."
+            )
+        raise ValidationError(
+            f"Invalid preview port {port!r}: must be an integer between "
+            f"{MIN_PREVIEW_PORT} and {MAX_PREVIEW_PORT}. Privileged ports "
+            f"(< {MIN_PREVIEW_PORT}) are not proxied."
+        )
+    return f"https://{port}-{sandbox_id}.{host}"
+
+
+def _region_from_api_key(api_key: str) -> str | None:
+    """Extract the region token from an API key, if any.
+
+    Returns ``None`` for legacy keys and anything else that doesn't match
+    ``ss_live_<region>_<random-32-char-base64url>``. Never raises on weird
+    keys.
+    """
+    match = _REGION_KEY_RE.match(api_key)
+    return match.group(1) if match else None
+
+
+def _derive_sandbox_host(base_url: str) -> str:
+    """Derive the data-plane sandbox host from the control-plane base URL.
+
+    Cells are matched off ``_KNOWN_REGIONS`` (which already pairs each base URL
+    with its sandbox host), so a new cell needs only its map entry -- no second
+    edit here. Staging is the one host that isn't a region cell, so it stays
+    special.
+
+    https://api.superserve.ai         -> sandbox.superserve.ai      (map: use)
+    https://api-usw.superserve.ai     -> usw-sandbox.superserve.ai  (map: usw)
+    https://api-staging.superserve.ai -> staging-sandbox.superserve.ai
+    Any other URL                      -> sandbox.superserve.ai (safe default)
+    """
+    try:
+        host = urlparse(base_url).hostname or ""
+        if host == "api-staging.superserve.ai":
+            return "staging-sandbox.superserve.ai"
+        for cell_base, cell_sandbox_host in _KNOWN_REGIONS.values():
+            if urlparse(cell_base).hostname == host:
+                return cell_sandbox_host
+    except ValueError:
+        pass
+    return DEFAULT_SANDBOX_HOST

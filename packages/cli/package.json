@@ -1,0 +1,51 @@
+{
+  "name": "@superserve/cli",
+  "version": "2.0.0",
+  "description": "Command-line interface for Superserve sandboxes",
+  "keywords": [
+    "cli",
+    "firecracker",
+    "microvm",
+    "sandbox",
+    "superserve"
+  ],
+  "homepage": "https://superserve.ai?utm_source=npm&utm_medium=package_meta",
+  "bugs": {
+    "url": "https://github.com/superserve-ai/superserve/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/superserve-ai/superserve.git",
+    "directory": "packages/cli"
+  },
+  "bin": {
+    "superserve": "dist/index.js"
+  },
+  "files": [
+    "dist/index.js"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "bun src/index.ts",
+    "build": "bun run scripts/build.ts",
+    "build:binaries": "bun run scripts/build.ts --binaries",
+    "typecheck": "tsc --noEmit",
+    "lint": "bunx oxlint",
+    "lint:fix": "bunx oxlint --fix",
+    "format": "bunx oxfmt --write",
+    "format:check": "bunx oxfmt --check",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@superserve/sdk": "workspace:*",
+    "@superserve/typescript-config": "workspace:*",
+    "@types/bun": "^1.2.4",
+    "commander": "^14.0.3",
+    "picocolors": "^1.1.1",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22.4"
+  }
+}

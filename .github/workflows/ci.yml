@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "docs/**"
+      - "guides/**"
+      - "scripts/**"
+      - "tests/**"
+      - "package.json"
+      - "bun.lock"
+      - "turbo.json"
+      - ".github/workflows/**"
+  # No `branches` or `paths` filter. A stacked PR targets its parent branch, not
+  # main, and a PR that only edits a root file matches no path filter; either way
+  # a filtered trigger reports no status at all, so the required check stays at
+  # "Expected" and the PR can never merge. GitHub tests the merge of the PR into
+  # its own base, so a stacked run covers the parent's changes too.
+  pull_request:
+  # The merge queue tests each queued PR merged onto main (and any PRs ahead of
+  # it) and waits for the same required check, so the job must keep its name.
+  # merge_group supports no `paths` filter, so every queue entry runs it.
+  merge_group:
+    types: [checks_requested]
+
+jobs:
+  ci:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Format check
+        run: bun run format:check
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Check docs nav matches OpenAPI spec
+        run: bun run docs:check-nav
+
+      - name: Test
+        run: bun run test
+
+      - name: Build
+        run: bun run build
+
+      # The npm package is dist/index.js run by node (>= 22.4), not bun.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Smoke-test the CLI bundle
+        env:
+          SUPERSERVE_TELEMETRY: "0"
+        run: node packages/cli/dist/index.js --help

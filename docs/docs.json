@@ -1,0 +1,327 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "luma",
+  "name": "Superserve",
+  "colors": {
+    "primary": "#B2FAB4",
+    "light": "#B2FAB4",
+    "dark": "#B2FAB4"
+  },
+  "fonts": {
+    "heading": {
+      "family": "Instrument Sans"
+    },
+    "body": {
+      "family": "Instrument Sans"
+    }
+  },
+  "background": {
+    "color": {
+      "dark": "#141414"
+    }
+  },
+  "styling": {
+    "codeblocks": {
+      "theme": {
+        "light": "github-light",
+        "dark": "github-dark-default"
+      }
+    }
+  },
+  "favicon": "/favicon.svg",
+  "logo": "/logo.svg",
+  "appearance": {
+    "default": "dark",
+    "strict": true
+  },
+  "navbar": {
+    "links": [
+      {
+        "type": "github",
+        "label": "GitHub",
+        "href": "https://github.com/superserve-ai/superserve"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Get Started",
+      "href": "https://console.superserve.ai/auth/signup/?utm_source=docs&utm_medium=navbar"
+    }
+  },
+  "contextual": {
+    "options": ["copy", "view", "claude", "mcp", "add-mcp", "cursor", "vscode"]
+  },
+  "redirects": [
+    {
+      "source": "/integrations/virtual-filesystems/mesa",
+      "destination": "/storage/mesa"
+    },
+    {
+      "source": "/integrations/virtual-filesystems/archil",
+      "destination": "/storage/archil"
+    }
+  ],
+  "navigation": {
+    "anchors": [
+      {
+        "anchor": "Documentation",
+        "icon": "book-open",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart", "api-key", "cli"]
+          },
+          {
+            "group": "Sandbox",
+            "pages": [
+              "sandbox/create",
+              "sandbox/connect",
+              "sandbox/lifecycle",
+              "sandbox/snapshots",
+              "sandbox/metadata",
+              "sandbox/networking",
+              "sandbox/preview-urls",
+              "sandbox/network-log",
+              "sandbox/desktop",
+              "sandbox/docker"
+            ]
+          },
+          {
+            "group": "Secrets & env vars",
+            "pages": [
+              "sandbox/environment-variables",
+              "secrets/overview",
+              "secrets/create",
+              "secrets/binding",
+              "secrets/audit"
+            ]
+          },
+          {
+            "group": "Templates",
+            "pages": [
+              "templates/overview",
+              "templates/create",
+              "templates/lifecycle",
+              "templates/build-spec"
+            ]
+          },
+          {
+            "group": "Commands",
+            "pages": [
+              "commands/overview",
+              "commands/streaming",
+              "commands/sessions"
+            ]
+          },
+          {
+            "group": "Filesystem",
+            "pages": ["filesystem/read-write"]
+          },
+          {
+            "group": "Storage",
+            "pages": ["storage/mesa", "storage/archil", "storage/cloud-buckets"]
+          },
+          {
+            "group": "Errors",
+            "pages": ["errors"]
+          }
+        ]
+      },
+      {
+        "anchor": "SDK Reference",
+        "icon": "code",
+        "groups": [
+          {
+            "group": "Reference",
+            "pages": [
+              "sdk-reference/sandbox",
+              "sdk-reference/secret",
+              "sdk-reference/snapshot",
+              "sdk-reference/template",
+              "sdk-reference/commands",
+              "sdk-reference/files"
+            ]
+          }
+        ]
+      },
+      {
+        "anchor": "REST API",
+        "icon": "server",
+        "groups": [
+          {
+            "group": "Sandboxes",
+            "pages": [
+              "GET /sandboxes",
+              "POST /sandboxes",
+              "GET /sandboxes/{sandbox_id}",
+              "PATCH /sandboxes/{sandbox_id}",
+              "DELETE /sandboxes/{sandbox_id}",
+              "POST /sandboxes/{sandbox_id}/pause",
+              "POST /sandboxes/{sandbox_id}/resume",
+              "POST /sandboxes/{sandbox_id}/activate",
+              "GET /sandboxes/{sandbox_id}/network",
+              "GET /sandboxes/{sandbox_id}/preview-ports",
+              "POST /sandboxes/{sandbox_id}/preview-ports",
+              "DELETE /sandboxes/{sandbox_id}/preview-ports/{port}",
+              "POST /sandboxes/{sandbox_id}/preview-ports/{port}/token",
+              "POST /sandboxes/{sandbox_id}/preview-ports/{port}/token/rotate"
+            ]
+          },
+          {
+            "group": "Snapshots",
+            "pages": [
+              "POST /sandboxes/{sandbox_id}/snapshot",
+              "GET /sandboxes/{sandbox_id}/snapshots",
+              "GET /snapshots/{snapshot_id}",
+              "PATCH /snapshots/{snapshot_id}",
+              "DELETE /snapshots/{snapshot_id}"
+            ]
+          },
+          {
+            "group": "Exec",
+            "pages": ["POST /exec", "POST /exec/stream", "GET /exec/connect"]
+          },
+          {
+            "group": "Files",
+            "pages": [
+              "GET /sandboxes/{sandbox_id}/files",
+              "GET /files",
+              "POST /files"
+            ]
+          },
+          {
+            "group": "Templates",
+            "pages": [
+              "GET /templates",
+              "POST /templates",
+              "GET /templates/{template_id}",
+              "DELETE /templates/{template_id}",
+              "GET /templates/{template_id}/builds",
+              "POST /templates/{template_id}/builds",
+              "GET /templates/{template_id}/builds/{build_id}",
+              "DELETE /templates/{template_id}/builds/{build_id}",
+              "GET /templates/{template_id}/builds/{build_id}/logs"
+            ]
+          },
+          {
+            "group": "Secrets",
+            "pages": [
+              "POST /secrets",
+              "GET /secrets",
+              "GET /secrets/{name}",
+              "PATCH /secrets/{name}",
+              "DELETE /secrets/{name}",
+              "POST /sandboxes/{sandbox_id}/secrets",
+              "DELETE /sandboxes/{sandbox_id}/secrets/{env_key}",
+              "GET /secrets/{name}/audit",
+              "GET /secrets/{name}/sandboxes",
+              "GET /providers"
+            ]
+          },
+          {
+            "group": "Team Management",
+            "pages": [
+              "PATCH /teams/{team_id}",
+              "GET /teams/{team_id}/members",
+              "POST /teams/{team_id}/members",
+              "DELETE /teams/{team_id}/members/{user_id}",
+              "GET /teams/{team_id}/roles",
+              "POST /teams/{team_id}/roles",
+              "DELETE /teams/{team_id}/roles/{assignment_id}",
+              "GET /teams/{team_id}/invitations",
+              "POST /teams/{team_id}/invitations",
+              "POST /teams/{team_id}/invitations/{invitation_id}/resend",
+              "POST /teams/{team_id}/invitations/{invitation_id}/revoke",
+              "POST /teams/{team_id}/invitations/{invitation_id}/delivery",
+              "POST /teams/{team_id}/leave"
+            ]
+          },
+          {
+            "group": "Activity",
+            "pages": ["GET /activity"]
+          }
+        ],
+        "openapi": "https://api.superserve.ai/openapi.yaml"
+      },
+      {
+        "anchor": "Integrations",
+        "icon": "puzzle-piece",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": ["integrations/overview"]
+          },
+          {
+            "group": "Coding Agents",
+            "pages": [
+              "integrations/coding-agents/claude",
+              "integrations/coding-agents/codex",
+              "integrations/coding-agents/kilocode",
+              "integrations/coding-agents/opencode",
+              "integrations/coding-agents/pi"
+            ]
+          },
+          {
+            "group": "Agent Frameworks",
+            "pages": [
+              "integrations/agent-harnesses/agno",
+              "integrations/agent-harnesses/claude-agent-sdk",
+              "integrations/agent-harnesses/crewai",
+              "integrations/agent-harnesses/langchain",
+              "integrations/agent-harnesses/openai-agents-sdk",
+              "integrations/agent-harnesses/pydantic-ai",
+              "integrations/agent-harnesses/vercel-ai-sdk"
+            ]
+          },
+          {
+            "group": "Personal Agents",
+            "pages": [
+              "integrations/personal-agents/hermes",
+              "integrations/personal-agents/openclaw"
+            ]
+          },
+          {
+            "group": "Managed Agents",
+            "pages": [
+              "integrations/managed-agents/claude-managed-agents",
+              "integrations/managed-agents/cursor-cloud-agents",
+              "integrations/managed-agents/omnara"
+            ]
+          },
+          {
+            "group": "Evaluations",
+            "pages": ["integrations/evaluations/harbor"]
+          },
+          {
+            "group": "MCP & Tools",
+            "pages": ["integrations/mcp"]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "x": "https://x.com/superserve_ai",
+      "github": "https://github.com/superserve-ai/",
+      "linkedin": "https://www.linkedin.com/company/super-serve-ai/"
+    },
+    "links": [
+      {
+        "header": "Resources",
+        "items": [
+          {
+            "label": "Status",
+            "href": "https://status.superserve.ai"
+          }
+        ]
+      }
+    ]
+  },
+  "integrations": {
+    "posthog": {
+      "apiKey": "phc_gjpDKKKQJAnkxkqLrPGrAhoariKsaHNuTpI5rVhkYre",
+      "apiHost": "https://p.superserve.ai"
+    }
+  }
+}

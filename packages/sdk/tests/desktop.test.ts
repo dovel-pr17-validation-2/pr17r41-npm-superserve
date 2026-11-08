@@ -1,0 +1,520 @@
+import { afterEach, describe, expect, it, vi } from "vitest"
+
+import { Desktop, type DesktopDeps } from "../src/desktop.js"
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  })
+}
+
+const sandboxId = "sbx-1"
+const sandboxHost = "sandbox.example.com"
+const rpcBase = `https://boxd-${sandboxId}.${sandboxHost}/superserve.boxd.v1.DesktopService`
+
+function makeDeps(overrides: Partial<DesktopDeps> = {}): DesktopDeps {
+  let token = "tok-initial"
+  return {
+    sandboxId,
+    sandboxHost,
+    getAccessToken: () => token,
+    refreshActivate: async () => {
+      token = "tok-refreshed"
+      return token
+    },
+    publishStreamPort: async () => "public" as const,
+    streamBaseUrl: () => `https://6080-${sandboxId}.${sandboxHost}`,
+    mintStreamToken: async () => ({
+      token: "spv1.secret",
+      queryParam: "superserve_preview_token",
+    }),
+    ...overrides,
+  }
+}
+
+/** Stub fetch, run `fn`, and return the recorded [url, parsed body] calls. */
+async function recordCalls(
+  responses: Response[],
+  fn: (desktop: Desktop) => Promise<unknown>,
+): Promise<Array<{ url: string; body: unknown; headers: Headers }>> {
+  const calls: Array<{ url: string; body: unknown; headers: Headers }> = []
+  let i = 0
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init: RequestInit) => {
+      calls.push({
+        url: String(url),
+        body: init.body ? JSON.parse(String(init.body)) : undefined,
+        headers: new Headers(init.headers),
+      })
+      return responses[Math.min(i++, responses.length - 1)]
+    }),
+  )
+  await fn(new Desktop(makeDeps()))
+  return calls
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+describe("Desktop.screenshot", () => {
+  it("decodes base64 PNG and dimensions", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    const image = btoa(String.fromCharCode(...png))
+    let shot: Awaited<ReturnType<Desktop["screenshot"]>> | undefined
+    const calls = await recordCalls(
+      [jsonResponse({ image, width: 1280, height: 800 })],
+      async (d) => {
+        shot = await d.screenshot()
+      },
+    )
+    expect(calls[0].url).toBe(`${rpcBase}/Screenshot`)
+    expect(calls[0].headers.get("X-Access-Token")).toBe("tok-initial")
+    expect(shot!.data).toEqual(png)
+    expect(shot!.width).toBe(1280)
+    expect(shot!.height).toBe(800)
+    expect(shot!.format).toBe("png")
+    expect(calls[0].body).toEqual({})
+  })
+
+  it("asks for JPEG only when told to and reports the frame's encoding", async () => {
+    const calls = await recordCalls(
+      [
+        jsonResponse({
+          image: btoa("\xff\xd8"),
+          width: 4,
+          height: 2,
+          format: "FRAME_FORMAT_JPEG",
+        }),
+      ],
+      async (d) => {
+        const shot = await d.screenshot({ format: "jpeg" })
+        expect(shot.format).toBe("jpeg")
+      },
+    )
+    expect(calls[0].body).toEqual({ format: "FRAME_FORMAT_JPEG" })
+  })
+
+  it("throws when the response has no image", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ width: 1, height: 1 })),
+    )
+    await expect(new Desktop(makeDeps()).screenshot()).rejects.toThrow(
+      /missing image/,
+    )
+  })
+})
+
+describe("Desktop pointer actions", () => {
+  it("click is a single RPC carrying move+click", async () => {
+    const calls = await recordCalls([jsonResponse({})], (d) => d.click(10, 20))
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe(`${rpcBase}/SendPointer`)
+    expect(calls[0].body).toEqual({
+      x: 10,
+      y: 20,
+      button: "POINTER_BUTTON_LEFT",
+      action: "POINTER_ACTION_CLICK",
+    })
+  })
+
+  it("treats 0 as a valid coordinate", async () => {
+    const calls = await recordCalls([jsonResponse({})], (d) => d.click(0, 300))
+    expect(calls[0].body).toMatchObject({ x: 0, y: 300 })
+  })
+
+  it("rejects negative and non-integer coordinates without a request", async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal("fetch", fetchSpy)
+    const desktop = new Desktop(makeDeps())
+    await expect(desktop.click(-1, 5)).rejects.toThrow(/Invalid coordinates/)
+    await expect(desktop.moveMouse(1.5, 5)).rejects.toThrow(
+      /Invalid coordinates/,
+    )
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("drag is one atomic batch: down, move, up", async () => {
+    const calls = await recordCalls([jsonResponse({ executed: 3 })], (d) =>
+      d.drag([1, 2], [30, 40]),
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe(`${rpcBase}/SendActions`)
+    const actions = (calls[0].body as { actions: unknown[] }).actions
+    expect(actions).toEqual([
+      {
+        pointer: {
+          x: 1,
+          y: 2,
+          button: "POINTER_BUTTON_LEFT",
+          action: "POINTER_ACTION_DOWN",
+        },
+      },
+      {
+        pointer: {
+          x: 30,
+          y: 40,
+          button: "POINTER_BUTTON_LEFT",
+          action: "POINTER_ACTION_MOVE",
+        },
+      },
+      {
+        pointer: {
+          x: 30,
+          y: 40,
+          button: "POINTER_BUTTON_LEFT",
+          action: "POINTER_ACTION_UP",
+        },
+      },
+    ])
+  })
+})
+
+describe("Desktop keyboard", () => {
+  it("write sends literal text", async () => {
+    const calls = await recordCalls([jsonResponse({})], (d) =>
+      d.write("hello world"),
+    )
+    expect(calls[0].url).toBe(`${rpcBase}/SendKey`)
+    expect(calls[0].body).toEqual({ text: "hello world" })
+  })
+
+  it("write with empty text is a no-op", async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal("fetch", fetchSpy)
+    await new Desktop(makeDeps()).write("")
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("press maps friendly names and splits chords", async () => {
+    const calls = await recordCalls(
+      [jsonResponse({}), jsonResponse({}), jsonResponse({})],
+      async (d) => {
+        await d.press("enter")
+        await d.press("ctrl+c")
+        await d.press(["cmd", "shift", "p"])
+      },
+    )
+    expect(calls[0].body).toEqual({ key: "Return", modifiers: [] })
+    expect(calls[1].body).toEqual({ key: "c", modifiers: ["ctrl"] })
+    expect(calls[2].body).toEqual({ key: "p", modifiers: ["super", "shift"] })
+  })
+
+  it("press passes unknown keysyms through verbatim", async () => {
+    const calls = await recordCalls([jsonResponse({})], (d) => d.press("F5"))
+    expect(calls[0].body).toEqual({ key: "F5", modifiers: [] })
+  })
+})
+
+describe("Desktop.scroll / resize / actions", () => {
+  it("scroll sends both axes", async () => {
+    const calls = await recordCalls([jsonResponse({})], (d) =>
+      d.scroll({ dx: -2, dy: 5 }),
+    )
+    expect(calls[0].url).toBe(`${rpcBase}/Scroll`)
+    expect(calls[0].body).toEqual({ dx: -2, dy: 5 })
+  })
+
+  it("resize posts dimensions", async () => {
+    const calls = await recordCalls([jsonResponse({})], (d) =>
+      d.resize(1024, 768),
+    )
+    expect(calls[0].url).toBe(`${rpcBase}/Resize`)
+    expect(calls[0].body).toEqual({ width: 1024, height: 768 })
+  })
+
+  it("actions maps every action type into one batch", async () => {
+    const calls = await recordCalls([jsonResponse({ executed: 3 })], (d) =>
+      d.actions([
+        { type: "click", x: 5, y: 6, button: "right" },
+        { type: "write", text: "hi" },
+        { type: "scroll", dy: 3 },
+      ]),
+    )
+    expect(calls).toHaveLength(1)
+    const actions = (calls[0].body as { actions: unknown[] }).actions
+    expect(actions).toEqual([
+      {
+        pointer: {
+          x: 5,
+          y: 6,
+          button: "POINTER_BUTTON_RIGHT",
+          action: "POINTER_ACTION_CLICK",
+        },
+      },
+      { key: { text: "hi" } },
+      { scroll: { dx: 0, dy: 3 } },
+    ])
+  })
+
+  it("empty actions batch is a no-op", async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal("fetch", fetchSpy)
+    await new Desktop(makeDeps()).actions([])
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("an invalid action anywhere rejects the batch before any request", async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal("fetch", fetchSpy)
+    await expect(
+      new Desktop(makeDeps()).actions([
+        { type: "click", x: 1, y: 1 },
+        { type: "move", x: -4, y: 2 },
+      ]),
+    ).rejects.toThrow(/Invalid coordinates/)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe("Desktop.getStreamUrl", () => {
+  it("activates the sandbox, publishes the port and returns the noVNC URL", async () => {
+    const order: string[] = []
+    const activate = vi.fn(async () => {
+      order.push("activate")
+      return "tok"
+    })
+    const publish = vi.fn(async () => {
+      order.push("publish")
+      return "public" as const
+    })
+    const mint = vi.fn()
+    const desktop = new Desktop(
+      makeDeps({
+        refreshActivate: activate,
+        publishStreamPort: publish,
+        mintStreamToken: mint,
+      }),
+    )
+    const url = await desktop.getStreamUrl()
+    expect(order).toEqual(["activate", "publish"])
+    expect(mint).not.toHaveBeenCalled()
+    expect(url).toBe(
+      `https://6080-${sandboxId}.${sandboxHost}/vnc.html?autoconnect=1&resize=scale`,
+    )
+  })
+
+  it("signs the URL when the port is private, keeping the viewer path and params", async () => {
+    const desktop = new Desktop(
+      makeDeps({ publishStreamPort: async () => "private" as const }),
+    )
+    const url = await desktop.getStreamUrl({ viewOnly: true })
+    expect(url).toBe(
+      `https://6080-${sandboxId}.${sandboxHost}/vnc.html?autoconnect=1&resize=scale&view_only=1&superserve_preview_token=spv1.secret`,
+    )
+  })
+
+  it("appends view_only when requested", async () => {
+    const desktop = new Desktop(makeDeps())
+    const url = await desktop.getStreamUrl({ viewOnly: true })
+    expect(url).toContain("view_only=1")
+  })
+})
+
+describe("Desktop token retry", () => {
+  it("activates and retries once on a stale token", async () => {
+    const tokens: Array<string | null> = []
+    let call = 0
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        tokens.push(new Headers(init.headers).get("X-Access-Token"))
+        call++
+        if (call === 1) {
+          return jsonResponse({ code: "unauthenticated" }, 401)
+        }
+        return jsonResponse({})
+      }),
+    )
+    await new Desktop(makeDeps()).click(1, 1)
+    expect(tokens).toEqual(["tok-initial", "tok-refreshed"])
+  })
+})
+
+describe("routing hint", () => {
+  it("sends the hint header when the sandbox has one, and nothing otherwise", async () => {
+    const sent: Headers[] = []
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        sent.push(new Headers(init.headers))
+        return jsonResponse({})
+      }),
+    )
+    await new Desktop(makeDeps({ getRoutingHint: () => "hint-1" })).click(1, 2)
+    await new Desktop(makeDeps()).click(1, 2)
+    expect(sent.map((h) => h.get("X-Superserve-Routing-Hint"))).toEqual([
+      "hint-1",
+      null,
+    ])
+  })
+})
+
+describe("Desktop.step", () => {
+  const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+  const png = btoa(String.fromCharCode(...pngBytes))
+
+  it("sends the batch and settle in one request and decodes the frame", async () => {
+    const calls = await recordCalls(
+      [
+        jsonResponse({
+          executed: 2,
+          screenshot: { image: png, width: 4, height: 2 },
+        }),
+      ],
+      async (d) => {
+        const result = await d.step(
+          [
+            { type: "click", x: 1, y: 2 },
+            { type: "press", key: "enter" },
+          ],
+          { settleMs: 300 },
+        )
+        expect(result).toEqual({
+          executed: 2,
+          screenshot: { data: pngBytes, width: 4, height: 2, format: "png" },
+        })
+      },
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe(`${rpcBase}/Step`)
+    expect(calls[0].body).toEqual({
+      actions: [
+        {
+          pointer: {
+            x: 1,
+            y: 2,
+            button: "POINTER_BUTTON_LEFT",
+            action: "POINTER_ACTION_CLICK",
+          },
+        },
+        { key: { key: "Return", modifiers: [] } },
+      ],
+      settleMs: 300,
+    })
+  })
+
+  it("asks for a changed frame and reports whether one arrived", async () => {
+    const calls = await recordCalls(
+      [
+        jsonResponse({
+          executed: 1,
+          screenshot: { image: png, width: 4, height: 2 },
+          changed: true,
+        }),
+      ],
+      async (d) => {
+        const result = await d.step([{ type: "click", x: 1, y: 2 }], {
+          waitForChange: true,
+          settleMs: 500,
+          quietMs: 60,
+        })
+        expect(result.changed).toBe(true)
+        expect(result.screenshot).toEqual({
+          data: pngBytes,
+          width: 4,
+          height: 2,
+          format: "png",
+        })
+      },
+    )
+    expect(calls[0].body).toMatchObject({
+      settleMs: 500,
+      waitForChange: true,
+      quietMs: 60,
+    })
+  })
+
+  it("carries the sandbox's phase timings and the frame's encoding", async () => {
+    const calls = await recordCalls(
+      [
+        jsonResponse({
+          executed: 1,
+          screenshot: {
+            image: png,
+            width: 4,
+            height: 2,
+            format: "FRAME_FORMAT_JPEG",
+          },
+          queueMs: 1,
+          actionsMs: 12,
+          captureMs: 30,
+        }),
+      ],
+      async (d) => {
+        const result = await d.step([{ type: "click", x: 1, y: 2 }], {
+          format: "jpeg",
+        })
+        expect(result.screenshot?.format).toBe("jpeg")
+        // settleMs is absent from the response: a zero phase is omitted.
+        expect(result.timings).toEqual({
+          queueMs: 1,
+          actionsMs: 12,
+          settleMs: 0,
+          captureMs: 30,
+        })
+      },
+    )
+    expect(calls[0].body).toMatchObject({ format: "FRAME_FORMAT_JPEG" })
+  })
+
+  it("reports changed as false when the changed-frame capture fails", async () => {
+    await recordCalls(
+      [jsonResponse({ executed: 1, captureError: "x server gone" })],
+      async (d) => {
+        const result = await d.step([{ type: "click", x: 1, y: 2 }], {
+          waitForChange: true,
+        })
+        expect(result.changed).toBe(false)
+        expect(result.screenshotError).toBe("x server gone")
+      },
+    )
+  })
+
+  it("reports a stopped batch together with its frame instead of throwing", async () => {
+    await recordCalls(
+      [
+        jsonResponse({
+          executed: 1,
+          actionError: "action 1 failed after 1 executed: boom",
+          screenshot: { image: png, width: 4, height: 2 },
+        }),
+      ],
+      async (d) => {
+        const result = await d.step([
+          { type: "click", x: 1, y: 2 },
+          { type: "press", key: "enter" },
+        ])
+        expect(result.executed).toBe(1)
+        expect(result.actionError).toContain("action 1")
+        expect(result.screenshot?.width).toBe(4)
+        expect(result.screenshotError).toBeUndefined()
+      },
+    )
+  })
+
+  it("reports a failed capture with the executed count", async () => {
+    await recordCalls(
+      [jsonResponse({ executed: 1, captureError: "import: nope" })],
+      async (d) => {
+        const result = await d.step([{ type: "click", x: 1, y: 2 }])
+        expect(result).toEqual({
+          executed: 1,
+          screenshotError: "import: nope",
+        })
+      },
+    )
+  })
+
+  it("rejects an empty batch without a request", async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal("fetch", fetchSpy)
+    await expect(new Desktop(makeDeps()).step([])).rejects.toThrow(
+      "actions is empty",
+    )
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+})

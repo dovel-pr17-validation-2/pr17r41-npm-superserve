@@ -1,0 +1,1157 @@
+import { act, render, screen, waitFor } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
+import { StrictMode } from "react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+// --- Mocks ---
+
+vi.mock("@superserve/ui", () => ({
+  cn: (...classes: Array<string | undefined | false>) =>
+    classes.filter(Boolean).join(" "),
+  Button: (props: React.JSX.IntrinsicElements["button"]) => (
+    <button {...props} />
+  ),
+  Input: ({
+    suffix,
+    error,
+    wrapperClassName: _wrapperClassName,
+    ...props
+  }: React.JSX.IntrinsicElements["input"] & {
+    suffix?: React.ReactNode
+    error?: string
+    wrapperClassName?: string
+  }) => (
+    <div>
+      <input {...props} />
+      {suffix}
+      {error && <p>{error}</p>}
+    </div>
+  ),
+}))
+
+vi.mock("@/components/corner-brackets", () => ({
+  CornerBrackets: () => null,
+}))
+vi.mock("@/components/dither-background", () => ({
+  DitherBackground: () => null,
+}))
+vi.mock("@/components/icons", () => ({
+  GoogleIcon: () => <span>GoogleIcon</span>,
+  Spinner: ({ className }: { className?: string }) => (
+    <div className={className}>spinner</div>
+  ),
+}))
+
+vi.mock("@phosphor-icons/react", () => ({
+  EyeIcon: () => <span>eye</span>,
+  EyeSlashIcon: () => <span>eye-slash</span>,
+}))
+
+vi.mock("next/image", () => ({
+  default: ({ alt, src }: { alt: string; src: string }) => (
+    <img alt={alt} src={src} />
+  ),
+}))
+
+// jsdom/happy-dom actually attempts the network load for a real <script>,
+// which errors loudly but harmlessly in this environment — mock it out.
+vi.mock("next/script", () => ({
+  default: () => null,
+}))
+
+const mockSignInWithOAuth = vi.fn()
+vi.mock("@/lib/supabase/client", () => ({
+  createBrowserClient: () => ({
+    auth: {
+      signInWithOAuth: mockSignInWithOAuth,
+    },
+  }),
+}))
+
+const mockEnsureFingerprintSignupEventId = vi.fn<
+  () => Promise<string | undefined>
+>(() => Promise.resolve(undefined))
+vi.mock("@/lib/fingerprint/client", () => ({
+  ensureFingerprintSignupCapture: () => mockEnsureFingerprintSignupEventId(),
+  clearFingerprintSignupCapture: vi.fn(),
+  getFingerprintSignupDiagnostics: () => ({ schema_version: 1, events: [] }),
+}))
+
+const mockSignUpWithEmail = vi.fn()
+const mockResendSignupConfirmation = vi.fn()
+const mockBeginGoogleSignup = vi.fn<
+  (
+    token?: string,
+    turnstileToken?: string,
+    capture?: unknown,
+    diagnostics?: unknown,
+  ) => Promise<
+    | { success: true; signupAttemptId: string }
+    | { success: false; error?: string }
+  >
+>(() =>
+  Promise.resolve({
+    success: true,
+    signupAttemptId: "attempt-default",
+  }),
+)
+const mockClaimGoogleRecoveryContinuation = vi.fn<
+  (reason: string) => Promise<boolean>
+>(() => Promise.resolve(false))
+vi.mock("./action", () => ({
+  claimGoogleRecoveryContinuation: (reason: string) =>
+    mockClaimGoogleRecoveryContinuation(reason),
+  signUpWithEmail: (...args: unknown[]) => mockSignUpWithEmail(...args),
+  resendSignupConfirmation: (...args: unknown[]) =>
+    mockResendSignupConfirmation(...args),
+  beginGoogleSignup: (...args: Parameters<typeof mockBeginGoogleSignup>) =>
+    mockBeginGoogleSignup(...args),
+  isCloudflareSignupObservationEnabled: () => Promise.resolve(false),
+}))
+
+let mockSearchParams = new URLSearchParams()
+const mockRouterPush = vi.fn()
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => mockSearchParams,
+  useRouter: () => ({ push: mockRouterPush }),
+}))
+
+vi.mock("next/link", () => ({
+  default: ({
+    children,
+    href,
+    className,
+  }: {
+    children: React.ReactNode
+    href: string
+    className?: string
+  }) => (
+    <a href={href} className={className}>
+      {children}
+    </a>
+  ),
+}))
+
+const mockCapture = vi.fn()
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({ capture: mockCapture }),
+}))
+
+// Captured once at module load, before any test mutates it, so both describe
+// blocks below can reliably restore whatever the real environment had.
+const ORIGINAL_RECAPTCHA_SITE_KEY = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY
+
+function restoreRecaptchaSiteKey() {
+  if (ORIGINAL_RECAPTCHA_SITE_KEY === undefined) {
+    delete process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY
+  } else {
+    process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY = ORIGINAL_RECAPTCHA_SITE_KEY
+  }
+}
+
+describe("SignUpPage", () => {
+  let user: ReturnType<typeof userEvent.setup>
+  // RECAPTCHA_SITE_KEY is read from process.env at module load. A static
+  // top-level `import SignUpPage from "./page"` would resolve before any
+  // beforeEach runs, so clearing the env var here wouldn't matter if a
+  // dev/CI environment had it set — dynamically import a fresh module per
+  // test instead, after the env var is explicitly cleared.
+  let SignUpPage: (typeof import("./page"))["default"]
+
+  beforeEach(async () => {
+    mockSignUpWithEmail.mockReset()
+    mockResendSignupConfirmation.mockReset()
+    mockBeginGoogleSignup.mockReset()
+    mockBeginGoogleSignup.mockResolvedValue({
+      success: true,
+      signupAttemptId: "attempt-default",
+    })
+    mockSignInWithOAuth.mockReset()
+    mockEnsureFingerprintSignupEventId.mockReset()
+    mockEnsureFingerprintSignupEventId.mockResolvedValue(undefined)
+    mockCapture.mockReset()
+    mockRouterPush.mockReset()
+    mockSearchParams = new URLSearchParams()
+    mockClaimGoogleRecoveryContinuation.mockReset().mockResolvedValue(false)
+    sessionStorage.clear()
+    delete process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY
+    vi.resetModules()
+    ;({ default: SignUpPage } = await import("./page"))
+    user = userEvent.setup()
+  })
+
+  afterEach(() => {
+    restoreRecaptchaSiteKey()
+  })
+
+  it("renders the signup form", async () => {
+    render(<SignUpPage />)
+
+    expect(
+      await screen.findByText("Create your Superserve account"),
+    ).toBeInTheDocument()
+    expect(screen.getByPlaceholderText("Full Name")).toBeInTheDocument()
+    expect(screen.getByPlaceholderText("Email")).toBeInTheDocument()
+    expect(screen.getByPlaceholderText("Password")).toBeInTheDocument()
+    expect(screen.getByPlaceholderText("Confirm Password")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Sign Up" })).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: /Continue with Google/ }),
+    ).toBeInTheDocument()
+  })
+
+  it("renders Complete signup mode without the account-creation form", async () => {
+    mockSearchParams = new URLSearchParams("complete_google=1")
+    const { default: RecoverySignUpPage } = await import("./page")
+    render(<RecoverySignUpPage />)
+
+    expect(await screen.findByText("Complete signup")).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: /Complete signup with Google/ }),
+    ).toBeInTheDocument()
+    expect(screen.queryByPlaceholderText("Full Name")).not.toBeInTheDocument()
+    expect(screen.queryByPlaceholderText("Email")).not.toBeInTheDocument()
+    expect(screen.queryByPlaceholderText("Password")).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "Sign Up" }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("shows inline errors when submitting with empty fields", async () => {
+    render(<SignUpPage />)
+
+    await user.click(await screen.findByRole("button", { name: "Sign Up" }))
+
+    expect(await screen.findByText("Name is required.")).toBeInTheDocument()
+    expect(screen.getByText("Email is required.")).toBeInTheDocument()
+    expect(screen.getByText("Password is required.")).toBeInTheDocument()
+    expect(mockSignUpWithEmail).not.toHaveBeenCalled()
+  })
+
+  it("shows an inline error when password is too short", async () => {
+    render(<SignUpPage />)
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      "Test User",
+    )
+    await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+    await user.type(screen.getByPlaceholderText("Password"), "1234567")
+    await user.type(screen.getByPlaceholderText("Confirm Password"), "1234567")
+    await user.click(screen.getByRole("button", { name: "Sign Up" }))
+
+    expect(
+      await screen.findByText("Must be at least 8 characters."),
+    ).toBeInTheDocument()
+  })
+
+  it("shows an inline error when passwords do not match", async () => {
+    render(<SignUpPage />)
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      "Test User",
+    )
+    await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+    await user.type(screen.getByPlaceholderText("Password"), "password123")
+    await user.type(
+      screen.getByPlaceholderText("Confirm Password"),
+      "different",
+    )
+    await user.click(screen.getByRole("button", { name: "Sign Up" }))
+
+    expect(
+      await screen.findByText("Passwords do not match."),
+    ).toBeInTheDocument()
+  })
+
+  it("preserves the claim destination when switching to sign in", async () => {
+    mockSearchParams = new URLSearchParams("offer=yc_2026&next=%2Fyc%2Fclaim")
+    render(<SignUpPage />)
+    const link = await screen.findByRole("link", { name: "Sign in" })
+    const url = new URL(
+      link.getAttribute("href")!,
+      "https://console.example.test",
+    )
+    expect(url.searchParams.get("next")).toBe("/yc/claim")
+    expect(url.searchParams.get("offer")).toBe("yc_2026")
+    expect(link).not.toHaveClass("ph-no-capture")
+  })
+
+  it("keeps an invite destination in the sign-in link out of session replay", async () => {
+    mockSearchParams = new URLSearchParams({
+      next: "/invite/ssinv_exampletoken",
+    })
+    render(<SignUpPage />)
+    const link = await screen.findByRole("link", { name: "Sign in" })
+    expect(
+      new URL(
+        link.getAttribute("href")!,
+        "https://console.example.test",
+      ).searchParams.get("next"),
+    ).toBe("/invite/ssinv_exampletoken")
+    expect(link).toHaveClass("ph-no-capture")
+  })
+
+  it("explains how to get a new link after an expired confirmation", async () => {
+    mockSearchParams = new URLSearchParams("error=link_expired")
+    render(<SignUpPage />)
+
+    expect(
+      await screen.findByText(
+        "This confirmation link expired or was already used. Sign up again with the same email and password to get a new link, or sign in if you already confirmed your email.",
+      ),
+    ).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Sign Up" })).toBeEnabled()
+  })
+
+  it("submits diagnostics and the YC return path together before showing email-sent state", async () => {
+    mockSignUpWithEmail.mockResolvedValue({ success: true })
+    mockSearchParams = new URLSearchParams({
+      offer: "pro_monthly",
+      next: "/yc/claim",
+    })
+    render(<SignUpPage />)
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      "Test User",
+    )
+    await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+    await user.type(screen.getByPlaceholderText("Password"), "password123")
+    await user.type(
+      screen.getByPlaceholderText("Confirm Password"),
+      "password123",
+    )
+    await user.click(screen.getByRole("button", { name: "Sign Up" }))
+
+    await waitFor(() => {
+      expect(screen.getByText("Check Your Email")).toBeInTheDocument()
+    })
+    expect(screen.getByRole("link", { name: "Sign in" })).toHaveAttribute(
+      "href",
+      "/auth/signin?offer=pro_monthly&next=%2Fyc%2Fclaim",
+    )
+    expect(mockSignUpWithEmail).toHaveBeenCalledWith(
+      "test@test.com",
+      "password123",
+      "Test User",
+      undefined,
+      undefined,
+      undefined,
+      "pro_monthly",
+      { schema_version: 1, events: [] },
+      "/yc/claim",
+    )
+  })
+
+  it("submits user-entered form values under StrictMode", async () => {
+    const { default: SignUpContent } = await import("./form")
+    const { signUpWithEmail, syntheticSignupValues, signupTrace } =
+      await import("@/test/ui/ss640/browser-dependencies")
+    signupTrace.submissions = []
+    mockSignUpWithEmail.mockImplementation(signUpWithEmail)
+    render(
+      <StrictMode>
+        <SignUpContent />
+      </StrictMode>,
+    )
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      syntheticSignupValues.fullName,
+    )
+    await user.type(
+      screen.getByPlaceholderText("Email"),
+      syntheticSignupValues.email,
+    )
+    await user.type(
+      screen.getByPlaceholderText("Password"),
+      syntheticSignupValues.password,
+    )
+    await user.type(
+      screen.getByPlaceholderText("Confirm Password"),
+      syntheticSignupValues.confirmPassword,
+    )
+    await user.click(await screen.findByRole("button", { name: "Sign Up" }))
+
+    expect(await screen.findByText("Check Your Email")).toBeInTheDocument()
+    expect(signupTrace.submissions).toHaveLength(1)
+    expect(screen.queryByRole("button", { name: "Sign Up" })).toBeNull()
+    expect(screen.getByRole("link", { name: "Sign in" })).toBeInTheDocument()
+  })
+
+  it("waits for capture to finish before submitting email signup", async () => {
+    let finishCapture!: (value: undefined) => void
+    const fingerprintPromise = new Promise<string | undefined>((resolve) => {
+      finishCapture = resolve
+    })
+    mockEnsureFingerprintSignupEventId.mockReturnValueOnce(fingerprintPromise)
+    mockSignUpWithEmail.mockResolvedValue({ success: true })
+    render(<SignUpPage />)
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      "Test User",
+    )
+    await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+    await user.type(screen.getByPlaceholderText("Password"), "password123")
+    await user.type(
+      screen.getByPlaceholderText("Confirm Password"),
+      "password123",
+    )
+    await user.click(screen.getByRole("button", { name: "Sign Up" }))
+
+    expect(mockEnsureFingerprintSignupEventId).toHaveBeenCalledTimes(1)
+    expect(mockSignUpWithEmail).not.toHaveBeenCalled()
+    finishCapture(undefined)
+
+    await waitFor(() => {
+      expect(mockSignUpWithEmail).toHaveBeenCalledWith(
+        "test@test.com",
+        "password123",
+        "Test User",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { schema_version: 1, events: [] },
+        "/",
+      )
+    })
+  })
+
+  it("shows inline form error when signUpWithEmail returns an error", async () => {
+    mockSignUpWithEmail.mockResolvedValue({
+      success: false,
+      error: "An account with this email already exists.",
+    })
+    render(<SignUpPage />)
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      "Test User",
+    )
+    await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+    await user.type(screen.getByPlaceholderText("Password"), "password123")
+    await user.type(
+      screen.getByPlaceholderText("Confirm Password"),
+      "password123",
+    )
+    await user.click(screen.getByRole("button", { name: "Sign Up" }))
+
+    expect(
+      await screen.findByText("An account with this email already exists."),
+    ).toBeInTheDocument()
+  })
+
+  it("redirects to auth-code-error when signup is blocked by the trigger", async () => {
+    mockSignUpWithEmail.mockResolvedValue({
+      success: false,
+      error: "Database error saving new user",
+      errorCode: "blocked_email",
+    })
+    render(<SignUpPage />)
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      "Test User",
+    )
+    await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+    await user.type(screen.getByPlaceholderText("Password"), "password123")
+    await user.type(
+      screen.getByPlaceholderText("Confirm Password"),
+      "password123",
+    )
+    await user.click(screen.getByRole("button", { name: "Sign Up" }))
+
+    await waitFor(() => {
+      expect(mockRouterPush).toHaveBeenCalledWith(
+        "/auth/auth-code-error?reason=signup_blocked",
+      )
+    })
+  })
+
+  it("shows generic error when signUpWithEmail throws", async () => {
+    mockSignUpWithEmail.mockRejectedValue(new Error("network error"))
+    render(<SignUpPage />)
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      "Test User",
+    )
+    await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+    await user.type(screen.getByPlaceholderText("Password"), "password123")
+    await user.type(
+      screen.getByPlaceholderText("Confirm Password"),
+      "password123",
+    )
+    await user.click(screen.getByRole("button", { name: "Sign Up" }))
+
+    expect(
+      await screen.findByText("Error creating account. Please try again."),
+    ).toBeInTheDocument()
+  })
+
+  it.each([
+    ["pro", "pro_monthly"],
+    ["pro_annual", "pro_annual"],
+    ["arbitrary_plan", null],
+  ])(
+    "carries only a valid offer through Google signup and the signin link: %s",
+    async (offer, expected) => {
+      mockSearchParams = new URLSearchParams({ offer: offer! })
+      mockSignInWithOAuth.mockResolvedValue({ error: null })
+      render(<SignUpPage />)
+      const link = await screen.findByRole("link", { name: "Sign in" })
+      expect(
+        new URL(
+          link.getAttribute("href")!,
+          "https://console.superserve.ai",
+        ).searchParams.get("offer"),
+      ).toBe(expected)
+      await user.click(
+        screen.getByRole("button", { name: /Continue with Google/ }),
+      )
+      await waitFor(() => expect(mockSignInWithOAuth).toHaveBeenCalled())
+      expect(
+        new URL(
+          mockSignInWithOAuth.mock.lastCall![0].options.redirectTo,
+        ).searchParams.get("offer"),
+      ).toBe(expected)
+    },
+  )
+
+  it("explains a reported recovery reason and continues to Google once", async () => {
+    mockSearchParams = new URLSearchParams(
+      "complete_google=1&reason=started_from_signin",
+    )
+    mockSignInWithOAuth.mockResolvedValue({ error: null })
+    // The browser's own failed callback left a recovery mark.
+    mockClaimGoogleRecoveryContinuation.mockResolvedValue(true)
+    const { default: RecoverySignUpPage } = await import("./page")
+    const first = render(<RecoverySignUpPage />)
+
+    expect(
+      await screen.findByText(
+        "Looks like you're new here. One quick check to finish creating your account.",
+      ),
+    ).toBeInTheDocument()
+    await waitFor(() => {
+      expect(mockClaimGoogleRecoveryContinuation).toHaveBeenCalledWith(
+        "started_from_signin",
+      )
+      expect(mockBeginGoogleSignup).toHaveBeenCalledTimes(1)
+      expect(mockSignInWithOAuth).toHaveBeenCalledTimes(1)
+    })
+
+    // Coming back with the check still failing leaves the button to the user.
+    first.unmount()
+    render(<RecoverySignUpPage />)
+    expect(
+      await screen.findByRole("button", {
+        name: /Complete signup with Google/,
+      }),
+    ).toBeInTheDocument()
+    expect(mockBeginGoogleSignup).toHaveBeenCalledTimes(1)
+  })
+
+  it("waits for a click when a link reports a reason the browser never hit", async () => {
+    mockSearchParams = new URLSearchParams("complete_google=1&reason=expired")
+    const { default: RecoverySignUpPage } = await import("./page")
+    render(<RecoverySignUpPage />)
+
+    expect(
+      await screen.findByRole("button", {
+        name: /Complete signup with Google/,
+      }),
+    ).toBeInTheDocument()
+    await waitFor(() =>
+      expect(mockClaimGoogleRecoveryContinuation).toHaveBeenCalledWith(
+        "expired",
+      ),
+    )
+    expect(mockBeginGoogleSignup).not.toHaveBeenCalled()
+    expect(mockSignInWithOAuth).not.toHaveBeenCalled()
+  })
+
+  it.each(["__proto__", "constructor", "something_else"])(
+    "shows the default recovery copy for an unknown reason %s",
+    async (reason) => {
+      mockSearchParams = new URLSearchParams(
+        `complete_google=1&reason=${reason}`,
+      )
+      const { default: RecoverySignUpPage } = await import("./page")
+      render(<RecoverySignUpPage />)
+
+      expect(
+        await screen.findByText(
+          "Google sign-in succeeded. Complete signup to finish verification and provision your Superserve account.",
+        ),
+      ).toBeInTheDocument()
+      expect(mockClaimGoogleRecoveryContinuation).not.toHaveBeenCalled()
+      expect(mockBeginGoogleSignup).not.toHaveBeenCalled()
+    },
+  )
+
+  it("waits for a click when the recovery page has no reported reason", async () => {
+    mockSearchParams = new URLSearchParams("complete_google=1")
+    const { default: RecoverySignUpPage } = await import("./page")
+    render(<RecoverySignUpPage />)
+
+    expect(
+      await screen.findByText(
+        "Google sign-in succeeded. Complete signup to finish verification and provision your Superserve account.",
+      ),
+    ).toBeInTheDocument()
+    expect(mockBeginGoogleSignup).not.toHaveBeenCalled()
+  })
+
+  it("triggers Google OAuth on button click", async () => {
+    mockBeginGoogleSignup.mockResolvedValue({
+      success: true,
+      signupAttemptId: "attempt-123",
+    })
+    mockSignInWithOAuth.mockResolvedValue({ error: null })
+    render(<SignUpPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: /Continue with Google/ }),
+    )
+
+    await waitFor(() => {
+      expect(mockBeginGoogleSignup).toHaveBeenCalledWith(
+        undefined,
+        undefined,
+        undefined,
+        { schema_version: 1, events: [] },
+      )
+      expect(mockSignInWithOAuth).toHaveBeenCalledWith({
+        provider: "google",
+        options: {
+          queryParams: { prompt: "select_account" },
+          redirectTo: expect.stringContaining(
+            "/auth/callback?signup_attempt_id=attempt-123",
+          ),
+        },
+      })
+    })
+  })
+
+  it("waits for capture to finish before starting Google signup", async () => {
+    let finishCapture!: (value: undefined) => void
+    const fingerprintPromise = new Promise<string | undefined>((resolve) => {
+      finishCapture = resolve
+    })
+    mockEnsureFingerprintSignupEventId.mockReturnValueOnce(fingerprintPromise)
+    mockBeginGoogleSignup.mockResolvedValue({
+      success: true,
+      signupAttemptId: "attempt-456",
+    })
+    render(<SignUpPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: /Continue with Google/ }),
+    )
+
+    expect(mockEnsureFingerprintSignupEventId).toHaveBeenCalledTimes(1)
+    expect(mockBeginGoogleSignup).not.toHaveBeenCalled()
+    finishCapture(undefined)
+
+    await waitFor(() => {
+      expect(mockBeginGoogleSignup).toHaveBeenCalledWith(
+        undefined,
+        undefined,
+        undefined,
+        { schema_version: 1, events: [] },
+      )
+      expect(mockSignInWithOAuth).toHaveBeenCalledWith({
+        provider: "google",
+        options: {
+          queryParams: { prompt: "select_account" },
+          redirectTo: expect.stringContaining(
+            "/auth/callback?signup_attempt_id=attempt-456",
+          ),
+        },
+      })
+    })
+  })
+
+  describe("confirmation email status", () => {
+    const submit = async () => {
+      await user.type(
+        await screen.findByPlaceholderText("Full Name"),
+        "Test User",
+      )
+      await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+      await user.type(screen.getByPlaceholderText("Password"), "password123")
+      await user.type(
+        screen.getByPlaceholderText("Confirm Password"),
+        "password123",
+      )
+      await user.click(screen.getByRole("button", { name: "Sign Up" }))
+    }
+    const notSent = {
+      success: false,
+      error:
+        "Your account was created, but we couldn't send the confirmation email.",
+      errorCode: "email_not_sent",
+    }
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it.each(["sent", "not_sent"])(
+      "keeps one protected invite sign-in link in the %s view",
+      async (status) => {
+        const invite = `/invite/ssinv_use_${"A".repeat(43)}`
+        mockSignUpWithEmail.mockResolvedValue(
+          status === "sent" ? { success: true } : notSent,
+        )
+        mockSearchParams = new URLSearchParams({ next: invite })
+        render(<SignUpPage />)
+
+        await submit()
+
+        expect(
+          await screen.findByText(
+            status === "sent"
+              ? "Check Your Email"
+              : "We couldn't send your confirmation email",
+          ),
+        ).toBeInTheDocument()
+        const links = screen.getAllByRole("link", { name: "Sign in" })
+        expect(links).toHaveLength(1)
+        expect(
+          new URL(
+            links[0].getAttribute("href")!,
+            "https://console.example.test",
+          ).searchParams.get("next"),
+        ).toBe(invite)
+        expect(links[0]).toHaveClass("ph-no-capture")
+        expect(
+          screen.getByRole("button", { name: /Resend confirmation email/ }),
+        ).toBeDisabled()
+        expect(screen.getByRole("button", { name: "Start over" })).toBeEnabled()
+      },
+    )
+
+    it("does not claim an email was sent when it was not", async () => {
+      mockSignUpWithEmail.mockResolvedValue(notSent)
+      mockSearchParams = new URLSearchParams({
+        signup_offer: "enterprise",
+        next: "/yc/claim",
+      })
+      render(<SignUpPage />)
+
+      await submit()
+
+      expect(
+        await screen.findByText("We couldn't send your confirmation email"),
+      ).toBeInTheDocument()
+      expect(screen.queryByText("Check Your Email")).not.toBeInTheDocument()
+      expect(
+        screen.getByRole("link", { name: "support@superserve.ai" }),
+      ).toHaveAttribute("href", "mailto:support@superserve.ai")
+      expect(
+        screen.getByRole("button", { name: /Resend confirmation email/ }),
+      ).toBeDisabled()
+      expect(screen.getByRole("link", { name: "Sign in" })).toHaveAttribute(
+        "href",
+        "/auth/signin?signup_offer=enterprise&next=%2Fyc%2Fclaim",
+      )
+    })
+
+    it("resends after the cooldown and then shows the sent state", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      mockSignUpWithEmail.mockResolvedValue(notSent)
+      mockResendSignupConfirmation.mockResolvedValue({ success: true })
+      render(<SignUpPage />)
+      await submit()
+      const resend = await screen.findByRole("button", {
+        name: "Resend confirmation email (60s)",
+      })
+      expect(resend).toBeDisabled()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000)
+      })
+      await user.click(
+        screen.getByRole("button", { name: "Resend confirmation email" }),
+      )
+
+      expect(await screen.findByText("Check Your Email")).toBeInTheDocument()
+      expect(mockResendSignupConfirmation).toHaveBeenCalledWith(
+        undefined,
+        "test@test.com",
+      )
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "We sent a new confirmation email.",
+      )
+      expect(
+        screen.getByRole("button", { name: "Resend confirmation email (60s)" }),
+      ).toBeDisabled()
+    })
+
+    it("offers a resend from the sent state and shows server errors", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      mockSignUpWithEmail.mockResolvedValue({ success: true })
+      mockResendSignupConfirmation.mockResolvedValue({
+        success: false,
+        error: "Please wait 12 seconds before you request another email.",
+        errorCode: "cooldown",
+        retryAfterSeconds: 12,
+      })
+      render(<SignUpPage />)
+      await submit()
+      expect(await screen.findByText("Check Your Email")).toBeInTheDocument()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000)
+      })
+      await user.click(
+        screen.getByRole("button", { name: "Resend confirmation email" }),
+      )
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Please wait 12 seconds",
+      )
+      expect(
+        screen.getByRole("button", { name: "Resend confirmation email (12s)" }),
+      ).toBeDisabled()
+    })
+
+    it("switches to the not-sent view when a resend fails", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      mockSignUpWithEmail.mockResolvedValue({ success: true })
+      mockResendSignupConfirmation.mockResolvedValue(notSent)
+      render(<SignUpPage />)
+      await submit()
+      expect(await screen.findByText("Check Your Email")).toBeInTheDocument()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000)
+      })
+      await user.click(
+        screen.getByRole("button", { name: "Resend confirmation email" }),
+      )
+
+      expect(
+        await screen.findByText("We couldn't send your confirmation email"),
+      ).toBeInTheDocument()
+      expect(screen.queryByText("Check Your Email")).not.toBeInTheDocument()
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "we couldn't send the confirmation email",
+      )
+    })
+
+    it("blocks start over while a resend is in flight", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      mockSignUpWithEmail.mockResolvedValue(notSent)
+      let finishResend: (value: { success: true }) => void = () => {}
+      mockResendSignupConfirmation.mockReturnValue(
+        new Promise((resolve) => {
+          finishResend = resolve
+        }),
+      )
+      render(<SignUpPage />)
+      await submit()
+      await screen.findByText("We couldn't send your confirmation email")
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000)
+      })
+
+      await user.click(
+        screen.getByRole("button", { name: "Resend confirmation email" }),
+      )
+      const startOverButton = screen.getByRole("button", { name: "Start over" })
+      expect(startOverButton).toBeDisabled()
+      await user.click(startOverButton)
+      expect(screen.queryByRole("button", { name: "Sign Up" })).toBeNull()
+
+      await act(async () => {
+        finishResend({ success: true })
+      })
+      expect(await screen.findByText("Check Your Email")).toBeInTheDocument()
+      expect(screen.getByRole("button", { name: "Start over" })).toBeEnabled()
+    })
+
+    it("keeps the submitted email if the field changes during signup", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      let finishSignup: (value: typeof notSent) => void = () => {}
+      mockSignUpWithEmail.mockReturnValue(
+        new Promise((resolve) => {
+          finishSignup = resolve
+        }),
+      )
+      mockResendSignupConfirmation.mockResolvedValue({ success: true })
+      render(<SignUpPage />)
+      await submit()
+      await waitFor(() => expect(mockSignUpWithEmail).toHaveBeenCalled())
+
+      const emailInput = screen.getByPlaceholderText("Email")
+      await user.clear(emailInput)
+      await user.type(emailInput, "changed@test.com")
+      await act(async () => {
+        finishSignup(notSent)
+      })
+
+      expect(await screen.findByText("test@test.com")).toBeInTheDocument()
+      expect(screen.queryByText("changed@test.com")).toBeNull()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000)
+      })
+      await user.click(
+        screen.getByRole("button", { name: "Resend confirmation email" }),
+      )
+      expect(mockResendSignupConfirmation).toHaveBeenCalledWith(
+        undefined,
+        "test@test.com",
+      )
+    })
+
+    it("lets the user start over with the entered details", async () => {
+      mockSignUpWithEmail.mockResolvedValue(notSent)
+      render(<SignUpPage />)
+      await submit()
+
+      await user.click(
+        await screen.findByRole("button", { name: "Start over" }),
+      )
+
+      expect(screen.getByPlaceholderText("Email")).toHaveValue("test@test.com")
+      expect(screen.getByRole("button", { name: "Sign Up" })).toBeEnabled()
+    })
+  })
+
+  it("has a link to sign in page", async () => {
+    render(<SignUpPage />)
+
+    const signInLink = await screen.findByRole("link", { name: "Sign in" })
+    expect(signInLink).toHaveAttribute("href", "/auth/signin")
+  })
+})
+
+// RECAPTCHA_SITE_KEY is read from process.env at module load, so exercising
+// the "configured" path needs a fresh module instance per test — same
+// reasoning as the dynamic import in the describe block above.
+describe("SignUpPage with reCAPTCHA configured", () => {
+  let user: ReturnType<typeof userEvent.setup>
+
+  beforeEach(() => {
+    mockSignUpWithEmail.mockReset()
+    mockBeginGoogleSignup.mockReset()
+    mockBeginGoogleSignup.mockResolvedValue({
+      success: true,
+      signupAttemptId: "attempt-configured",
+    })
+    mockEnsureFingerprintSignupEventId.mockReset()
+    mockEnsureFingerprintSignupEventId.mockResolvedValue(undefined)
+    mockSearchParams = new URLSearchParams()
+    process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY = "test-site-key"
+    vi.resetModules()
+    user = userEvent.setup()
+  })
+
+  afterEach(() => {
+    restoreRecaptchaSiteKey()
+    delete (window as { grecaptcha?: unknown }).grecaptcha
+    vi.resetModules()
+  })
+
+  it("shows an actionable error instead of submitting when the token can't be obtained", async () => {
+    ;(window as { grecaptcha?: unknown }).grecaptcha = {
+      enterprise: {
+        ready: (callback: () => void) => callback(),
+        execute: () => Promise.reject(new Error("blocked by content blocker")),
+      },
+    }
+    const { default: ConfiguredSignUpPage } = await import("./page")
+    render(<ConfiguredSignUpPage />)
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      "Test User",
+    )
+    await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+    await user.type(screen.getByPlaceholderText("Password"), "password123")
+    await user.type(
+      screen.getByPlaceholderText("Confirm Password"),
+      "password123",
+    )
+    await user.click(screen.getByRole("button", { name: "Sign Up" }))
+
+    expect(
+      await screen.findByText(/content or ad blocker/i),
+    ).toBeInTheDocument()
+    expect(mockSignUpWithEmail).not.toHaveBeenCalled()
+  })
+
+  it("does not start OAuth when server-side Google verification fails", async () => {
+    mockBeginGoogleSignup.mockResolvedValue({
+      success: false,
+      error: "We couldn't verify you're human. Please try again.",
+    })
+    ;(window as { grecaptcha?: unknown }).grecaptcha = {
+      enterprise: {
+        ready: (callback: () => void) => callback(),
+        execute: () => Promise.resolve("google-token"),
+      },
+    }
+    const { default: ConfiguredSignUpPage } = await import("./page")
+    render(<ConfiguredSignUpPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: /Continue with Google/ }),
+    )
+
+    expect(mockBeginGoogleSignup).toHaveBeenCalledWith(
+      "google-token",
+      undefined,
+      undefined,
+      { schema_version: 1, events: [] },
+    )
+    expect(mockSignInWithOAuth).not.toHaveBeenCalled()
+    expect(await screen.findByText(/couldn't verify/i)).toBeInTheDocument()
+  })
+
+  it("requests signup_google reCAPTCHA before Google OAuth", async () => {
+    const execute = vi.fn().mockResolvedValue("google-token")
+    let resolveBeginSignup!: () => void
+    const beginSignupPromise = new Promise<{
+      success: true
+      signupAttemptId: string
+    }>((resolve) => {
+      resolveBeginSignup = () =>
+        resolve({ success: true, signupAttemptId: "attempt-test" })
+    })
+    mockBeginGoogleSignup.mockReturnValue(beginSignupPromise)
+    ;(window as { grecaptcha?: unknown }).grecaptcha = {
+      enterprise: {
+        ready: (callback: () => void) => callback(),
+        execute,
+      },
+    }
+    const { default: ConfiguredSignUpPage } = await import("./page")
+    render(<ConfiguredSignUpPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: /Continue with Google/ }),
+    )
+
+    await waitFor(() => {
+      expect(execute).toHaveBeenCalledWith("test-site-key", {
+        action: "signup_google",
+      })
+      expect(mockBeginGoogleSignup).toHaveBeenCalledWith(
+        "google-token",
+        undefined,
+        undefined,
+        { schema_version: 1, events: [] },
+      )
+    })
+    expect(mockSignInWithOAuth).not.toHaveBeenCalled()
+
+    resolveBeginSignup()
+
+    await waitFor(() => {
+      expect(mockSignInWithOAuth).toHaveBeenCalledWith({
+        provider: "google",
+        options: {
+          redirectTo: expect.stringContaining("/auth/callback"),
+          queryParams: { prompt: "select_account" },
+        },
+      })
+    })
+  })
+
+  it("preserves next when completing signup with Google", async () => {
+    mockSearchParams = new URLSearchParams(
+      "complete_google=1&offer=yc_2026&next=https%3A%2F%2Fapp.superserve.ai%2Fdevice%2Fabc",
+    )
+    const execute = vi.fn().mockResolvedValue("google-token")
+    mockBeginGoogleSignup.mockResolvedValue({
+      success: true,
+      signupAttemptId: "attempt-complete-google",
+    })
+    ;(window as { grecaptcha?: unknown }).grecaptcha = {
+      enterprise: {
+        ready: (callback: () => void) => callback(),
+        execute,
+      },
+    }
+    const { default: ConfiguredSignUpPage } = await import("./page")
+    render(<ConfiguredSignUpPage />)
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: /Complete signup with Google/,
+      }),
+    )
+
+    await waitFor(() => {
+      expect(execute).toHaveBeenCalledWith("test-site-key", {
+        action: "signup_google",
+      })
+      expect(
+        new URL(
+          mockSignInWithOAuth.mock.lastCall![0].options.redirectTo,
+        ).searchParams.get("offer"),
+      ).toBe("yc_2026")
+      expect(mockBeginGoogleSignup).toHaveBeenCalledWith(
+        "google-token",
+        undefined,
+        undefined,
+        { schema_version: 1, events: [] },
+      )
+      expect(mockSignInWithOAuth).toHaveBeenCalledWith({
+        provider: "google",
+        options: {
+          queryParams: { prompt: "select_account" },
+          redirectTo: expect.stringContaining(
+            "next=https%3A%2F%2Fapp.superserve.ai%2Fdevice%2Fabc",
+          ),
+        },
+      })
+    })
+  })
+
+  it("submits with a token once reCAPTCHA succeeds", async () => {
+    mockSignUpWithEmail.mockResolvedValue({ success: true })
+    ;(window as { grecaptcha?: unknown }).grecaptcha = {
+      enterprise: {
+        ready: (callback: () => void) => callback(),
+        execute: () => Promise.resolve("real-token"),
+      },
+    }
+    const { default: ConfiguredSignUpPage } = await import("./page")
+    render(<ConfiguredSignUpPage />)
+
+    await user.type(
+      await screen.findByPlaceholderText("Full Name"),
+      "Test User",
+    )
+    await user.type(screen.getByPlaceholderText("Email"), "test@test.com")
+    await user.type(screen.getByPlaceholderText("Password"), "password123")
+    await user.type(
+      screen.getByPlaceholderText("Confirm Password"),
+      "password123",
+    )
+    await user.click(screen.getByRole("button", { name: "Sign Up" }))
+
+    await waitFor(() => {
+      expect(mockSignUpWithEmail).toHaveBeenCalledWith(
+        "test@test.com",
+        "password123",
+        "Test User",
+        "real-token",
+        undefined,
+        undefined,
+        undefined,
+        { schema_version: 1, events: [] },
+        "/",
+      )
+    })
+  })
+})

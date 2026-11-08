@@ -1,0 +1,650 @@
+---
+title: "Sandbox"
+sidebarTitle: Sandbox
+description: The Sandbox class - factory methods, sandbox methods, properties, and types.
+---
+
+The `Sandbox` class is the main entry point for the SDK. Python ships both a sync `Sandbox` and an `AsyncSandbox` with identical method names. On `AsyncSandbox`, every method that calls the API is a coroutine. `get_preview_url` only builds a string, so it is a plain method on both classes: call it without `await`.
+
+## Import
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "@superserve/sdk"
+```
+
+```python Python
+from superserve import Sandbox
+# Async variant (await every method except get_preview_url):
+from superserve import AsyncSandbox
+```
+
+</CodeGroup>
+
+## Authentication
+
+The SDK reads `SUPERSERVE_API_KEY` from the environment by default. Pass `apiKey` / `api_key` explicitly to override, and `baseUrl` / `base_url` to target a different control-plane URL.
+
+```bash
+export SUPERSERVE_API_KEY=ss_live_...
+export SUPERSERVE_BASE_URL=https://api.superserve.ai  # optional
+```
+
+## Connection reuse (Python async)
+
+The sync SDK reuses connections across calls. In async Python, calls on an `AsyncSandbox` reuse its connection. Wrap other calls in `async_connection_pool()` to reuse connections across them. The connections close when the block ends.
+
+```python
+from superserve import AsyncSandbox, AsyncSnapshot, async_connection_pool
+
+async with async_connection_pool():
+    sandbox = await AsyncSandbox.create(name="example")
+    snapshots = await AsyncSnapshot.list(sandbox.id)
+```
+
+## Factory methods
+
+### `Sandbox.create`
+
+Create and boot a new sandbox. Synchronous - when the promise resolves, the VM is `active`.
+
+<CodeGroup>
+```typescript TypeScript
+const sandbox = await Sandbox.create({
+  name: "data-analyzer",
+  timeoutSeconds: 3600,
+  metadata: { env: "prod" },
+  envVars: { OPENAI_API_KEY: "sk-..." },
+  network: {
+    // deny everything except OpenAI and the sandbox's DNS resolvers
+    allowOut: ["api.openai.com", "1.1.1.1/32", "8.8.8.8/32"],
+    denyOut: ["0.0.0.0/0"],
+  },
+  previewAccess: "private",
+})
+```
+
+```python Python
+from superserve import Sandbox, NetworkConfig
+
+sandbox = Sandbox.create(
+    name="data-analyzer",
+    timeout_seconds=3600,
+    metadata={"env": "prod"},
+    env_vars={"OPENAI_API_KEY": "sk-..."},
+    network=NetworkConfig(
+        # deny everything except OpenAI and the sandbox's DNS resolvers
+        allow_out=["api.openai.com", "1.1.1.1/32", "8.8.8.8/32"],
+        deny_out=["0.0.0.0/0"],
+    ),
+    preview_access="private",
+)
+```
+
+</CodeGroup>
+
+**Options:**
+
+| Option                                      | Type                     | Description                                                                                                                                                                                                                                        |
+| ------------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                                      | `string`                 | **Required.** Human-readable sandbox name.                                                                                                                                                                                                         |
+| `fromTemplate` / `from_template`            | `string \| Template`     | Template name, UUID, or `Template` instance to boot from. Defaults to `superserve/base`.                                                                                                                                                           |
+| `fromSnapshot` / `from_snapshot`            | `string \| Snapshot`     | Snapshot ID or `Snapshot` to create the sandbox from. It starts with the snapshot's files and running processes. See [Snapshots and forks](/sandbox/snapshots).                                                                                        |
+| `timeoutSeconds` / `timeout_seconds`        | `number`                 | Auto-pause after this many seconds of active time (per session; re-armed on resume). See [Lifecycle](/sandbox/lifecycle#auto-pause).                                                                                                               |
+| `idleTimeoutSeconds` / `idle_timeout_seconds` | `number`                 | Auto-pause after this many seconds with no activity (60 to 604800). Requires SDK 0.11.6+. See [Lifecycle](/sandbox/lifecycle#idle-timeout).                                                                                                      |
+| `autoDeleteSeconds` / `auto_delete_seconds` | `number`                 | Delete the sandbox once continuously paused for this many seconds (max 30 days, `0` = delete on pause). See [Lifecycle](/sandbox/lifecycle#auto-delete).                                                                                           |
+| `metadata`                                  | `Record<string, string>` | String tags.                                                                                                                                                                                                                                       |
+| `envVars` / `env_vars`                      | `Record<string, string>` | Env vars injected into every process.                                                                                                                                                                                                              |
+| `secrets`                                   | `Record<string, string>` | Bind secrets to env vars (`ENV_VAR → secret name`). The agent sees a stand-in token; the real credential is attached to outbound requests. See [Secrets](/secrets/overview).                                                                       |
+| `network`                                   | `NetworkConfig`          | Egress allow/deny rules.                                                                                                                                                                                                                           |
+| `previewAccess` / `preview_access`          | `"public" \| "private"`  | Enable explicit publication and set the default access for newly published ports. Each port can override it. Omit to use strict `public`; `legacy_public` is only returned for pre-migration sandboxes. See [Preview URLs](/sandbox/preview-urls). |
+| `apiKey` / `api_key`                        | `string`                 | Overrides `SUPERSERVE_API_KEY`.                                                                                                                                                                                                                    |
+| `baseUrl` / `base_url`                      | `string`                 | Overrides `SUPERSERVE_BASE_URL`.                                                                                                                                                                                                                   |
+| `signal`                                    | `AbortSignal`            | TypeScript only - abort the creation request.                                                                                                                                                                                                      |
+
+### `Sandbox.connect`
+
+Reconnect to an existing sandbox by ID. Returns a live `sandbox` with a fresh access token. If the sandbox is currently `paused`, it is auto-resumed before returning so it's immediately usable.
+
+<CodeGroup>
+```typescript TypeScript
+const sandbox = await Sandbox.connect("7a3f2b8c-1234-...")
+```
+
+```python Python
+sandbox = Sandbox.connect("7a3f2b8c-1234-...")
+```
+
+</CodeGroup>
+
+### `Sandbox.list`
+
+List sandboxes on the authenticated team. `metadata` returns only sandboxes
+matching every key-value pair you pass; `status` filters to one lifecycle
+state; `limit`/`offset` page through the list.
+
+<CodeGroup>
+```typescript TypeScript
+const all = await Sandbox.list()
+const prod = await Sandbox.list({ metadata: { env: "prod" } })
+const running = await Sandbox.list({ status: "active" })
+const page = await Sandbox.list({ limit: 100, offset: 100 })
+```
+
+```python Python
+all_boxes = Sandbox.list()
+prod = Sandbox.list(metadata={"env": "prod"})
+running = Sandbox.list(status="active")
+page = Sandbox.list(limit=100, offset=100)
+```
+
+</CodeGroup>
+
+Returns an array of [`SandboxInfo`](#sandboxinfo).
+
+### `Sandbox.killById` / `Sandbox.kill_by_id`
+
+Delete a sandbox by ID without instantiating it. Idempotent.
+
+<CodeGroup>
+```typescript TypeScript
+await Sandbox.killById("7a3f2b8c-1234-...")
+```
+
+```python Python
+Sandbox.kill_by_id("7a3f2b8c-1234-...")
+```
+
+</CodeGroup>
+
+### `Sandbox.updateById` / `Sandbox.update_by_id`
+
+Update a sandbox by ID without instantiating it. Unlike `connect(id)` followed
+by `update(...)`, this does **not** resume a paused sandbox — so it's the right
+way to arm auto-delete or change the auto-pause timeout on a box you want to
+leave paused.
+Same fields and clear-with-`null`/`None` semantics as [`update`](#update).
+
+<CodeGroup>
+```typescript TypeScript
+await Sandbox.updateById("7a3f2b8c-1234-...", { autoDeleteSeconds: 3600 })
+```
+
+```python Python
+Sandbox.update_by_id("7a3f2b8c-1234-...", auto_delete_seconds=3600)
+```
+
+</CodeGroup>
+
+## Methods on `sandbox`
+
+### `getInfo` / `get_info`
+
+Fetch the current server-side state. Returns a fresh [`SandboxInfo`](#sandboxinfo) - the returned `sandbox`'s own `status` / `metadata` properties are snapshots and are **not** mutated.
+
+<CodeGroup>
+```typescript TypeScript
+const info = await sandbox.getInfo()
+console.log(info.status)  // e.g. "active" — see SandboxStatus
+```
+
+```python Python
+info = sandbox.get_info()
+print(info.status.value)  # e.g. "active" — see SandboxStatus
+```
+
+</CodeGroup>
+
+### `pause`
+
+Checkpoint the VM state to disk. Returns once the pause is accepted; the sandbox transitions to `pausing` and then `paused` on its own. Pass `wait` to return once it is `paused`.
+
+| Option                               | Type          | Description                                                                                                        |
+| ------------------------------------ | ------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `wait`                               | `boolean`     | Return once the sandbox is `paused` rather than once the pause is accepted. A sandbox configured to delete on pause counts as done once it is deleted. Default `false`. |
+| `timeoutMs` / `timeout`              | `number`      | With `wait`, how long to wait for `paused` before raising a timeout. TypeScript in milliseconds, Python in seconds. Default 5 minutes. |
+| `pollIntervalMs` / `poll_interval_s` | `number`      | With `wait`, how often to check the status if the server stopped waiting before the pause landed; a waited pause is otherwise one held request with no polling. Default 1 second. TypeScript in milliseconds, Python in seconds. |
+| `signal` (TypeScript only)           | `AbortSignal` | Cancels the request, and the polling when `wait` is set.                                                           |
+
+<CodeGroup>
+```typescript TypeScript
+await sandbox.pause()
+// or, to return only once the sandbox is paused:
+// await sandbox.pause({ wait: true })
+```
+
+```python Python
+sandbox.pause()
+# or, to return only once the sandbox is paused:
+# sandbox.pause(wait=True)
+```
+
+</CodeGroup>
+
+### `snapshot`
+
+Save the sandbox's memory and disk as a [`Snapshot`](/sdk-reference/snapshot), which is kept until you delete it. A running sandbox pauses briefly while the snapshot is taken. Returns once the snapshot is `ready`.
+
+| Option                               | Type          | Description |
+| ------------------------------------ | ------------- | ----------- |
+| `name`                               | `string`      | Label, 1 to 64 characters. |
+| `idempotencyKey` / `idempotency_key` | `string`      | Retrying with the same key returns the same snapshot instead of taking a new one. Generated if you don't pass one. |
+| `wait`                               | `boolean`     | Wait until the snapshot is `ready`. Default `true`. |
+| `timeoutMs` / `timeout`              | `number`      | Maximum time for taking the snapshot and waiting for it. TypeScript in milliseconds, Python in seconds. Default 15 minutes. |
+| `pollIntervalMs` / `poll_interval_s` | `number`      | How often to check while waiting. TypeScript in milliseconds, Python in seconds. Default 2 seconds. |
+| `signal` (TypeScript only)           | `AbortSignal` | Cancels the request and the wait. |
+
+<CodeGroup>
+```typescript TypeScript
+const snapshot = await sandbox.snapshot({ name: "before-upgrade" })
+```
+
+```python Python
+snapshot = sandbox.snapshot(name="before-upgrade")
+```
+
+</CodeGroup>
+
+### `snapshots`
+
+List this sandbox's snapshots, newest first. Takes `limit` and `offset`. Returns `SnapshotInfo[]`.
+
+### `resume`
+
+Restore a paused sandbox. A pause still in progress is waited out first, under the same controls as `pause` with `wait`. The backend rotates the per-sandbox access token; the SDK re-injects it into `sandbox.files` transparently.
+
+| Option                               | Type          | Description                                                                                                        |
+| ------------------------------------ | ------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `timeoutMs` / `timeout`              | `number`      | How long to wait out a pause in progress before raising a timeout. TypeScript in milliseconds, Python in seconds. Default 5 minutes. |
+| `pollIntervalMs` / `poll_interval_s` | `number`      | How often to check the status while waiting. When unset, the SDK checks every 50 ms for the first two seconds, then every second. TypeScript in milliseconds, Python in seconds. |
+| `signal` (TypeScript only)           | `AbortSignal` | Cancels the resume request and any waiting.                                                                        |
+
+<CodeGroup>
+```typescript TypeScript
+await sandbox.resume()
+```
+
+```python Python
+sandbox.resume()
+```
+
+</CodeGroup>
+
+### `kill`
+
+Delete the sandbox. Idempotent - swallows `404`.
+
+<CodeGroup>
+```typescript TypeScript
+await sandbox.kill()
+```
+
+```python Python
+sandbox.kill()
+```
+
+</CodeGroup>
+
+### `update`
+
+Patch `metadata`, `network`, lifecycle windows, and/or the default access for
+newly published preview ports on a sandbox.
+
+<CodeGroup>
+```typescript TypeScript
+await sandbox.update({
+  metadata: { env: "staging" },
+  network: { allowOut: ["api.openai.com"] },
+})
+
+// Auto-delete: a number arms the window, null disarms it.
+await sandbox.update({ autoDeleteSeconds: 3600 })
+await sandbox.update({ autoDeleteSeconds: null })
+
+// Auto-pause timeout: same set/clear contract.
+await sandbox.update({ timeoutSeconds: 900 })
+await sandbox.update({ timeoutSeconds: null })
+
+// Idle timeout (SDK 0.11.6+): same set/clear contract.
+await sandbox.update({ idleTimeoutSeconds: 600 })
+await sandbox.update({ idleTimeoutSeconds: null })
+
+await sandbox.update({ previewAccess: "private" })
+
+````
+
+```python Python
+sandbox.update(
+    metadata={"env": "staging"},
+    network=NetworkConfig(allow_out=["api.openai.com"]),
+)
+
+# Auto-delete: a number arms the window, None disarms it.
+sandbox.update(auto_delete_seconds=3600)
+sandbox.update(auto_delete_seconds=None)
+
+# Auto-pause timeout: same set/clear contract.
+sandbox.update(timeout_seconds=900)
+sandbox.update(timeout_seconds=None)
+
+# Idle timeout (SDK 0.11.6+): same set/clear contract.
+sandbox.update(idle_timeout_seconds=600)
+sandbox.update(idle_timeout_seconds=None)
+
+sandbox.update(preview_access="private")
+````
+
+</CodeGroup>
+
+On an already-paused sandbox, arming `autoDeleteSeconds` starts the countdown from the moment of the call — never retroactively from when the sandbox paused. See [Lifecycle](/sandbox/lifecycle#auto-delete).
+
+Moving a compatibility sandbox onto `public` or `private` closes every
+unpublished port. See [Preview URLs](/sandbox/preview-urls) for the safe
+publication and migration flow. Changing between `public` and `private` later
+does not rewrite the access mode of ports that are already published.
+
+### Preview URL methods
+
+Preview URLs use an explicit published-port allowlist. The URL builder alone
+does not publish or authenticate a port.
+
+| TypeScript                              | Python                                                | Description                                                                           |
+| --------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `getPreviewUrl(port)`                   | `get_preview_url(port)`                               | Construct `https://{port}-{id}.{host}` without a network call. Synchronous in both SDKs; do not `await` it on `AsyncSandbox`. |
+| `listPreviewPorts()`                    | `list_preview_ports()`                                | Return the sandbox default plus every port's access; tokens are never listed.         |
+| `publishPreviewPort(port, { access? })` | `publish_preview_port(port, access=...)`              | Publish a port; omit access to preserve an existing mode or use the new-port default. |
+| `unpublishPreviewPort(port)`            | `unpublish_preview_port(port)`                        | Close a port and revoke its credentials.                                              |
+| `getPreviewToken(port, options?)`       | `get_preview_token(port, expires_in_seconds=...)`     | Mint a per-port header/query credential.                                              |
+| `getSignedPreviewUrl(port, options?)`   | `get_signed_preview_url(port, expires_in_seconds=60)` | Mint a browser bootstrap URL; defaults to 60 seconds.                                 |
+| `rotatePreviewToken(port)`              | `rotate_preview_token(port)`                          | Revoke one port's old credentials and return a fresh token.                           |
+
+See the [Preview URLs guide](/sandbox/preview-urls) for policy selection,
+machine headers, browser cookies, and revocation examples.
+
+### Desktop methods
+
+`sandbox.desktop` drives a GUI desktop and requires a desktop-enabled template
+such as `superserve/desktop`. Every method is one request; a paused sandbox
+resumes on first use.
+
+| TypeScript                            | Python                                    | Description                                                                       |
+| ------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------- |
+| `desktop.screenshot({ format? })`     | `desktop.screenshot(format="png")`        | Capture the screen; returns `data` (PNG, or JPEG with `format`) plus `width`, `height` and `format`. |
+| `desktop.click(x, y, { button? })`    | `desktop.click(x, y, button=...)`         | Move and click in one request. Also `doubleClick` / `double_click`, `rightClick` / `right_click`, `middleClick` / `middle_click`. |
+| `desktop.moveMouse(x, y)`             | `desktop.move_mouse(x, y)`                | Move the pointer without clicking.                                                |
+| `desktop.drag(from, to, { button? })` | `desktop.drag(start, end, button=...)`    | Press, move, release as one atomic batch.                                         |
+| `desktop.scroll({ dx?, dy? })`        | `desktop.scroll(dx=0, dy=0)`              | Scroll by wheel clicks under the pointer; positive `dy` scrolls down.             |
+| `desktop.write(text)`                 | `desktop.write(text)`                     | Type literal text with no per-character pacing.                                   |
+| `desktop.press(key)`                  | `desktop.press(key)`                      | Press a key or chord: `"enter"`, `"ctrl+c"`, `["ctrl", "shift", "p"]`.            |
+| `desktop.actions(actions)`            | `desktop.actions(actions)`                | Run an ordered batch in one request; stops at the first failing action.           |
+| `desktop.step(actions, { waitForChange?, settleMs?, quietMs?, format? })` | `desktop.step(actions, wait_for_change=False, settle_ms=0, format="png", quiet_ms=0)` | Run a batch and capture the frame after it in one request, the first changed frame with `waitForChange`; `timings` says where the sandbox spent the turn; failures are reported in the result, not thrown. |
+| `desktop.resize(width, height)`       | `desktop.resize(width, height)`           | Resize the display live. Width a multiple of 8, 320–8192; height 200–8192.        |
+| `desktop.getStreamUrl({ viewOnly? })` | `desktop.get_stream_url(view_only=False)` | Publish the viewer port and return a browser URL; signed for 60 s under `private`. |
+
+See the [Desktop guide](/sandbox/desktop) for the action vocabulary, key
+names, and viewer access.
+### `attachSecret` / `attach_secret`
+
+Bind a team secret to a live or paused sandbox under an environment variable. The sandbox sees a stand-in token; the real credential is swapped in for outbound requests to the secret's allowed hosts. Takes effect for processes started after the call; a paused sandbox applies it on resume.
+
+<CodeGroup>
+```typescript TypeScript
+await sandbox.attachSecret("ANTHROPIC_API_KEY", "anthropic-prod")
+```
+
+```python Python
+sandbox.attach_secret("ANTHROPIC_API_KEY", "anthropic-prod")
+```
+
+</CodeGroup>
+
+### `detachSecret` / `detach_secret`
+
+Remove a secret binding by its environment-variable key. The stand-in token is revoked, so requests using it are refused — within about a minute for a process already running. A paused sandbox applies the change on resume.
+
+<CodeGroup>
+```typescript TypeScript
+await sandbox.detachSecret("ANTHROPIC_API_KEY")
+```
+
+```python Python
+sandbox.detach_secret("ANTHROPIC_API_KEY")
+```
+
+</CodeGroup>
+
+### `getNetworkLog` / `get_network_log`
+
+The sandbox's network log — every outbound HTTP and HTTPS connection to a public address on ports 80 and 443, and every secret-bearing request, newest first. Platform-level drops of private, link-local, and loopback addresses are not recorded. Returns a `NetworkLogPage`. See the [Network log](/sandbox/network-log) guide for the full model.
+
+<CodeGroup>
+```typescript TypeScript
+const page = await sandbox.getNetworkLog({ verdict: "blocked", limit: 100 })
+for (const e of page.events) console.log(e.kind, e.host, e.verdict ?? e.status)
+```
+
+```python Python
+page = sandbox.get_network_log(verdict="blocked", limit=100)
+for e in page.events:
+    print(e.kind, e.host, e.verdict or e.status)
+```
+
+</CodeGroup>
+
+| Option    | Type                                 | Description                                                                                                                                                                 |
+| --------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `limit`   | `number`                             | Events per page. Default `100`, maximum `1000`.                                                                                                                             |
+| `before`  | `string`                             | Opaque pagination cursor — pass the previous page's `nextCursor` to page through results. Also accepts an RFC3339 timestamp as a time filter (rows strictly older than it). |
+| `since`   | `string`                             | RFC3339 — rows at or newer than this.                                                                                                                                       |
+| `verdict` | `"allowed" \| "blocked" \| "failed"` | Filter to connections with this verdict (excludes request rows).                                                                                                            |
+
+`NetworkLogPage` has `events` ([`NetworkEvent[]`](#networkevent)), `nextCursor` / `next_cursor`, and `hasMore` / `has_more`.
+
+## Properties on `sandbox`
+
+`id`, `name`, `status`, `metadata`, `previewAccess` / `preview_access`, and `secrets` are read-only snapshots taken at construction. Call `getInfo()` / `get_info()` for fresh data. `attachSecret` / `detachSecret` do not update `secrets`, and sandboxes returned by `create` and `connect` have no `secrets` value. Read bindings from `getInfo()` / `get_info()`.
+
+| Property                           | Type                                       | Description                                                                                  |
+| ---------------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `id`                               | `string`                                   | Unique sandbox UUID.                                                                         |
+| `name`                             | `string`                                   | Human-readable name.                                                                         |
+| `status`                           | `SandboxStatus`                            | Status at construction time.                                                                 |
+| `metadata`                         | `Record<string, string>`                   | Tags at construction time.                                                                   |
+| `previewAccess` / `preview_access` | `"legacy_public" \| "public" \| "private"` | Preview compatibility mode or default access for newly published ports at construction time. |
+| `secrets`                          | `SandboxSecretBinding[] \| undefined`      | Bound secrets (`envKey` → `secretName`, with a `revoked` flag) at construction time. Use `getInfo()` / `get_info()` for current bindings. |
+| `commands`                         | `Commands`                                 | See [Commands](/sdk-reference/commands).                                                     |
+| `files`                            | `Files`                                    | See [Files](/sdk-reference/files). Rebuilt after `resume()`.                                 |
+| `desktop`                          | `Desktop`                                  | See [Desktop methods](#desktop-methods). Requires a desktop-enabled template.                |
+
+## Types
+
+### `SandboxStatus`
+
+<CodeGroup>
+```typescript TypeScript
+type SandboxStatus =
+  | "starting"
+  | "active"
+  | "pausing"
+  | "paused"
+  | "resuming"
+  | "failed"
+  | "deleted"
+```
+
+```python Python
+from enum import Enum
+
+class SandboxStatus(str, Enum):
+    STARTING = "starting"
+    ACTIVE = "active"
+    PAUSING = "pausing"
+    PAUSED = "paused"
+    RESUMING = "resuming"
+    FAILED = "failed"
+    DELETED = "deleted"
+```
+
+</CodeGroup>
+
+- `starting` - a new sandbox is booting
+- `active` - running and ready to accept commands
+- `pausing` - a pause is in progress
+- `paused` - stopped with state saved to disk
+- `resuming` - a paused sandbox is being restored
+- `failed` - the sandbox couldn't boot or resume; the entry remains until you delete it
+- `deleted` - removed; deleted sandboxes do not appear in list results
+
+Deletion removes the sandbox entirely - subsequent API calls return `404`.
+
+### `SandboxInfo`
+
+<CodeGroup>
+```typescript TypeScript
+interface SandboxInfo {
+  id: string
+  name: string
+  status: SandboxStatus
+  vcpuCount: number
+  memoryMib: number
+  createdAt: Date
+  timeoutSeconds?: number
+  idleTimeoutSeconds?: number
+  autoDeleteSeconds?: number
+  autoDeleteAt?: Date // present only while paused with autoDeleteSeconds set
+  network?: NetworkConfig
+  metadata: Record<string, string>
+  previewAccess: "legacy_public" | "public" | "private"
+  sourceSnapshotId?: string // set when the sandbox was created from a snapshot
+  secrets?: SandboxSecretBinding[] // { envKey, secretName, revoked? }
+}
+```
+
+```python Python
+from datetime import datetime
+from pydantic import BaseModel
+
+class SandboxInfo(BaseModel):
+    id: str
+    name: str
+    status: SandboxStatus
+    vcpu_count: int
+    memory_mib: int
+    created_at: datetime
+    timeout_seconds: int | None = None
+    idle_timeout_seconds: int | None = None
+    auto_delete_seconds: int | None = None
+    # Set only while paused with auto_delete_seconds configured.
+    auto_delete_at: datetime | None = None
+    network: NetworkConfig | None = None
+    metadata: dict[str, str]
+    preview_access: PreviewAccess
+    # Set when the sandbox was created from a snapshot.
+    source_snapshot_id: str | None = None
+    # Each binding has env_key, secret_name, and revoked.
+    secrets: list[SandboxSecretBinding] | None = None
+```
+
+</CodeGroup>
+
+### `NetworkConfig`
+
+<CodeGroup>
+```typescript TypeScript
+interface NetworkConfig {
+  allowOut?: string[]  // IPs, CIDRs, or domain patterns (a bare IP reads back as /32)
+  denyOut?: string[]   // IPs and CIDRs only - use "0.0.0.0/0" to deny all
+}
+```
+
+```python Python
+from pydantic import BaseModel
+
+class NetworkConfig(BaseModel):
+    allow_out: list[str] | None = None  # IPs, CIDRs, or domain patterns (a bare IP reads back as /32)
+    deny_out: list[str] | None = None   # IPs and CIDRs only - use "0.0.0.0/0" to deny all
+```
+
+</CodeGroup>
+
+### `NetworkEvent`
+
+One row of the [network log](/sandbox/network-log). `kind` selects which fields are present; fields that don't apply to a row are absent.
+
+<CodeGroup>
+```typescript TypeScript
+interface NetworkEvent {
+  kind: "connection" | "request"
+  id: number
+  ts: Date
+  host?: string
+
+  // connection rows
+  dstIp?: string
+  dstPort?: number
+  verdict?: "allowed" | "blocked" | "failed"
+  matchRule?: string
+  bytesSent?: number
+  bytesRecv?: number
+
+  // request rows
+  method?: string
+  path?: string
+  status?: number         // status returned to the sandbox
+  upstreamStatus?: number // absent when the proxy answered the request itself
+  latencyMs?: number
+  secretId?: string       // present only when a secret was attached
+  errorCode?: string      // for example "host_not_allowed" or "credential_revoked"
+}
+```
+
+```python Python
+from datetime import datetime
+from pydantic import BaseModel
+from superserve import NetworkVerdict
+
+class NetworkEvent(BaseModel):
+    kind: str  # "connection" or "request"
+    id: int
+    ts: datetime
+    host: str | None = None
+
+    # connection rows
+    dst_ip: str | None = None
+    dst_port: int | None = None
+    verdict: NetworkVerdict | None = None  # str enum: "allowed", "blocked", "failed"
+    match_rule: str | None = None
+    bytes_sent: int | None = None
+    bytes_recv: int | None = None
+
+    # request rows
+    method: str | None = None
+    path: str | None = None
+    status: int | None = None           # status returned to the sandbox
+    upstream_status: int | None = None  # absent when the proxy answered the request itself
+    latency_ms: int | None = None
+    secret_id: str | None = None        # present only when a secret was attached
+    error_code: str | None = None       # for example "host_not_allowed" or "credential_revoked"
+```
+
+</CodeGroup>
+
+See [Two kinds of rows](/sandbox/network-log#two-kinds-of-rows) for what each field means.
+
+## Retries
+
+GET and DELETE requests auto-retry on `429`, `502`, `503`, `504`, and network errors with exponential backoff + jitter (3 attempts max). POST and PATCH are not retried - the SDK surfaces the error so you can decide.
+
+See [Errors](/errors).
+
+## Errors
+
+Sandbox methods commonly raise:
+
+- `AuthenticationError` - missing or invalid API key
+- `ValidationError` - bad request body
+- `NotFoundError` - sandbox doesn't exist (except `kill` / `killById`, which swallow 404)
+- `ConflictError` - wrong state (e.g., pausing an already-paused sandbox, or patching `network` while paused)
+- `ServerError` - platform error
+
+See [Errors](/errors) for the full hierarchy.

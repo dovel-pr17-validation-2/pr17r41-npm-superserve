@@ -1,0 +1,248 @@
+import type {
+  ActivityListParams,
+  SandboxListParams,
+  TemplateListParams,
+} from "./types"
+
+export const sandboxKeys = {
+  all: ["sandboxes"] as const,
+  lists: () => [...sandboxKeys.all, "list"] as const,
+  list: (params: SandboxListParams) =>
+    [...sandboxKeys.lists(), params] as const,
+  details: () => [...sandboxKeys.all, "detail"] as const,
+  detail: (id: string) => [...sandboxKeys.details(), id] as const,
+}
+
+export const platformSandboxKeys = {
+  all: ["platform-sandboxes"] as const,
+  byTeam: (teamId: string) => [...platformSandboxKeys.all, teamId] as const,
+  detail: (teamId: string, sandboxId: string) =>
+    [...platformSandboxKeys.byTeam(teamId), sandboxId] as const,
+}
+
+export const fileKeys = {
+  all: ["sandbox-files"] as const,
+  listings: (sandboxId: string) => [...fileKeys.all, sandboxId] as const,
+  listing: (sandboxId: string, path: string) =>
+    [...fileKeys.listings(sandboxId), path] as const,
+}
+
+export const apiKeyKeys = {
+  all: ["api-keys"] as const,
+  lists: () => [...apiKeyKeys.all, "list"] as const,
+  list: (filters?: { search?: string }) =>
+    [...apiKeyKeys.lists(), filters] as const,
+}
+
+export const snapshotKeys = {
+  all: ["snapshots"] as const,
+  lists: () => [...snapshotKeys.all, "list"] as const,
+  list: (filters?: { search?: string }) =>
+    [...snapshotKeys.lists(), filters] as const,
+  bySandbox: (sandboxId: string) =>
+    [...snapshotKeys.all, "sandbox", sandboxId] as const,
+}
+
+export const auditLogKeys = {
+  all: ["audit-logs"] as const,
+  lists: () => [...auditLogKeys.all, "list"] as const,
+  list: (params: ActivityListParams) =>
+    [...auditLogKeys.lists(), params] as const,
+  bySandbox: (sandboxId: string) =>
+    [...auditLogKeys.all, "sandbox", sandboxId] as const,
+}
+
+export const secretKeys = {
+  all: ["secrets"] as const,
+  lists: () => [...secretKeys.all, "list"] as const,
+  list: (filters?: { search?: string }) =>
+    [...secretKeys.lists(), filters ?? {}] as const,
+  details: () => [...secretKeys.all, "detail"] as const,
+  // Accepts undefined so disabled hooks (e.g. useSecret(undefined)) keep a
+  // distinct cache key per call site instead of all aliasing to details().
+  detail: (name: string | undefined) =>
+    [...secretKeys.details(), name] as const,
+  audit: (name: string | undefined, filters?: { status?: string }) =>
+    [...secretKeys.detail(name), "audit", filters ?? {}] as const,
+  sandboxes: (name: string | undefined) =>
+    [...secretKeys.detail(name), "sandboxes"] as const,
+}
+
+export const providerKeys = {
+  all: ["providers"] as const,
+}
+
+export const networkKeys = {
+  sandbox: (sandboxId: string | undefined) =>
+    ["network", "sandbox", sandboxId] as const,
+}
+
+export const billingKeys = {
+  all: ["billing"] as const,
+  capabilities: (context: {
+    cacheScope: string
+    teamKey: string
+    actor: string
+  }) =>
+    [
+      "billing",
+      "capabilities",
+      context.cacheScope,
+      context.actor,
+      context.teamKey,
+    ] as const,
+  publicPlans: (region: string) => ["billing", "public-plans", region] as const,
+  customer: {
+    all: ["billing", "customer"] as const,
+    exportPreview: (context: {
+      cacheScope: string
+      teamKey: string
+      periodId: string
+    }) =>
+      [
+        ...billingKeys.customer.all,
+        "export-preview",
+        context.cacheScope,
+        context.teamKey,
+        context.periodId,
+      ] as const,
+    periods: (context: {
+      cacheScope: string
+      teamKey: string
+      limit: number
+    }) =>
+      [
+        ...billingKeys.customer.all,
+        "periods",
+        context.cacheScope,
+        context.teamKey,
+        context.limit,
+      ] as const,
+    usage: (context: {
+      cacheScope: string
+      teamKey: string
+      periodStart: string
+      periodEnd: string
+    }) =>
+      [
+        ...billingKeys.customer.all,
+        "usage",
+        context.cacheScope,
+        context.teamKey,
+        context.periodStart,
+        context.periodEnd,
+      ] as const,
+  },
+  planChangePreview: (context: {
+    cacheScope: string
+    teamKey: string
+    target: string
+  }) =>
+    [
+      ...billingKeys.all,
+      "v2",
+      "plan-change-preview",
+      context.cacheScope,
+      context.teamKey,
+      context.target,
+    ] as const,
+  v2: (
+    resource: "plan" | "free-allowance" | "prepaid",
+    context: { cacheScope: string; teamKey: string },
+  ) =>
+    [
+      ...billingKeys.all,
+      "v2",
+      resource,
+      context.cacheScope,
+      context.teamKey,
+    ] as const,
+  pricingVersion: (context: { cacheScope: string; teamKey: string }) =>
+    [
+      ...billingKeys.all,
+      "pricing-version",
+      context.cacheScope,
+      context.teamKey,
+    ] as const,
+  summary: (context: { cacheScope: string; teamKey: string }) =>
+    [
+      ...billingKeys.all,
+      "summary",
+      context.cacheScope,
+      context.teamKey,
+    ] as const,
+  prepaid: (context: { cacheScope: string; teamKey: string }) =>
+    [
+      ...billingKeys.all,
+      "prepaid",
+      context.cacheScope,
+      context.teamKey,
+    ] as const,
+  settings: (context: { cacheScope: string; teamKey: string }) =>
+    [
+      ...billingKeys.all,
+      "settings",
+      context.cacheScope,
+      context.teamKey,
+    ] as const,
+  usage: (context: {
+    cacheScope: string
+    teamKey: string
+    periodStart: string
+    periodEnd: string
+  }) =>
+    [
+      ...billingKeys.all,
+      "usage",
+      context.cacheScope,
+      context.teamKey,
+      context.periodStart,
+      context.periodEnd,
+    ] as const,
+  usageSeries: (context: {
+    cacheScope: string
+    teamKey: string
+    start: string
+    end: string
+    granularity: string
+    timezone: string
+  }) =>
+    [
+      ...billingKeys.all,
+      "usage-series",
+      context.cacheScope,
+      context.teamKey,
+      context.start,
+      context.end,
+      context.granularity,
+      context.timezone,
+    ] as const,
+}
+
+export const templateKeys = {
+  all: ["templates"] as const,
+  // Paginated list backing the Templates page.
+  lists: () => [...templateKeys.all, "list"] as const,
+  list: (params: TemplateListParams) =>
+    [...templateKeys.lists(), params] as const,
+  // Full (unpaginated) list backing the create-sandbox template picker.
+  fullLists: () => [...templateKeys.all, "full"] as const,
+  fullList: (filters?: { name_prefix?: string }) =>
+    [...templateKeys.fullLists(), filters ?? {}] as const,
+  details: () => [...templateKeys.all, "detail"] as const,
+  detail: (id: string) => [...templateKeys.details(), id] as const,
+  builds: (templateId: string) =>
+    [...templateKeys.detail(templateId), "builds"] as const,
+  build: (templateId: string, buildId: string) =>
+    [...templateKeys.builds(templateId), buildId] as const,
+}
+
+export const quotaKeys = {
+  all: ["quota"] as const,
+  usage: () => [...quotaKeys.all, "usage"] as const,
+}
+
+export const teamKeys = {
+  all: ["teams"] as const,
+  directory: () => [...teamKeys.all, "directory"] as const,
+}

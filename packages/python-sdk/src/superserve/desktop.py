@@ -1,0 +1,642 @@
+"""``sandbox.desktop`` - control a GUI desktop inside a sandbox.
+
+Requires a desktop-enabled template (one whose image runs an X server and
+exposes boxd's DesktopService). Every action is a single authenticated
+data-plane RPC: a coordinate click is one round trip, a drag is one batched
+request, and typing has no artificial per-character pacing.
+
+A paused sandbox is transparently resumed on first use, like ``commands``
+and ``files``.
+"""
+
+from __future__ import annotations
+
+import base64
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal
+from urllib.parse import urlencode
+
+import httpx
+
+from ._config import data_plane_target
+from ._http import api_request, async_api_request
+from ._routing_hint import routing_hint_headers
+from .types import PreviewAccessPolicy, PreviewToken
+from ._token_retry import async_with_token_retry, with_token_retry
+
+_RPC_BASE = "/superserve.boxd.v1.DesktopService"
+
+#: Port the desktop template serves noVNC (websockify) on.
+DESKTOP_STREAM_PORT = 6080
+# Screenshots are the one large data-plane response; the data plane is
+# untrusted, so the body is capped while it is read (matches the TS SDK).
+MAX_SCREENSHOT_RESPONSE_BYTES = 48 * 1024 * 1024
+
+MouseButton = Literal["left", "right", "middle"]
+#: Encoding of a captured frame. PNG is lossless; JPEG is several times
+#: smaller and faster to encode, for loops where a model reads the frame.
+FrameFormat = Literal["png", "jpeg"]
+
+_BUTTONS: dict[str, str] = {
+    "left": "POINTER_BUTTON_LEFT",
+    "right": "POINTER_BUTTON_RIGHT",
+    "middle": "POINTER_BUTTON_MIDDLE",
+}
+
+# Friendly key names -> X keysyms, so agent-facing code can say "enter" or
+# "ctrl". Unlisted names pass through verbatim (all X keysyms stay usable).
+_KEYSYMS: dict[str, str] = {
+    "enter": "Return",
+    "return": "Return",
+    "esc": "Escape",
+    "escape": "Escape",
+    "tab": "Tab",
+    "space": "space",
+    "backspace": "BackSpace",
+    "delete": "Delete",
+    "insert": "Insert",
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "home": "Home",
+    "end": "End",
+    "pageup": "Page_Up",
+    "pagedown": "Page_Down",
+    "ctrl": "ctrl",
+    "control": "ctrl",
+    "alt": "alt",
+    "shift": "shift",
+    "cmd": "super",
+    "win": "super",
+    "super": "super",
+}
+
+
+@dataclass(frozen=True)
+class Screenshot:
+    """A captured frame: encoded bytes (see ``format``) plus the display
+    dimensions."""
+
+    data: bytes
+    width: int
+    height: int
+    format: str = "png"
+
+
+@dataclass(frozen=True)
+class DesktopDeps:
+    """Internal deps from Sandbox. ``refresh_activate`` is invoked on 401."""
+
+    sandbox_id: str
+    sandbox_host: str
+    get_access_token: Callable[[], str]
+    refresh_activate: Callable[[], str]
+    publish_stream_port: Callable[[], PreviewAccessPolicy]
+    stream_base_url: Callable[[], str]
+    mint_stream_token: Callable[[], PreviewToken]
+    get_routing_hint: Callable[[], str | None] = lambda: None
+    refresh_expired_hint: Callable[[], str] | None = None
+
+
+@dataclass(frozen=True)
+class AsyncDesktopDeps:
+    """Async variant of DesktopDeps."""
+
+    sandbox_id: str
+    sandbox_host: str
+    get_access_token: Callable[[], str]
+    refresh_activate: Callable[[], Awaitable[str]]
+    publish_stream_port: Callable[[], Awaitable[PreviewAccessPolicy]]
+    stream_base_url: Callable[[], str]
+    mint_stream_token: Callable[[], Awaitable[PreviewToken]]
+    get_routing_hint: Callable[[], str | None] = lambda: None
+    refresh_expired_hint: Callable[[], Awaitable[str]] | None = None
+
+
+def _keysym(key: str) -> str:
+    return _KEYSYMS.get(key.lower(), key)
+
+
+def _chord_parts(key: str | Sequence[str]) -> tuple[list[str], str]:
+    """Split a chord into (modifiers, final key) for the KeyEvent RPC.
+
+    ``press("ctrl+c")`` and ``press(["ctrl", "c"])`` are equivalent.
+    """
+    parts = [_keysym(p) for p in (key.split("+") if isinstance(key, str) else key)]
+    if not parts or any(p == "" for p in parts):
+        raise ValueError("press: empty key")
+    return parts[:-1], parts[-1]
+
+
+def _assert_coordinate(x: int, y: int) -> None:
+    # 0 is a valid coordinate — validate explicitly, never with truthiness.
+    if not isinstance(x, int) or not isinstance(y, int) or x < 0 or y < 0:
+        raise ValueError(f"Invalid coordinates ({x}, {y}): must be integers >= 0")
+
+
+def _pointer_body(x: int, y: int, action: str, button: MouseButton = "left") -> dict:
+    _assert_coordinate(x, y)
+    return {"x": x, "y": y, "button": _BUTTONS[button], "action": action}
+
+
+def _action_body(action: dict[str, Any]) -> dict[str, Any]:
+    """Lower one ``desktop.actions()`` step into its proto-JSON shape."""
+    kind = action.get("type")
+    if kind == "click":
+        return {
+            "pointer": _pointer_body(
+                action["x"],
+                action["y"],
+                "POINTER_ACTION_CLICK",
+                action.get("button", "left"),
+            )
+        }
+    if kind == "double_click":
+        return {
+            "pointer": _pointer_body(
+                action["x"], action["y"], "POINTER_ACTION_DOUBLE_CLICK"
+            )
+        }
+    if kind == "move":
+        return {
+            "pointer": _pointer_body(action["x"], action["y"], "POINTER_ACTION_MOVE")
+        }
+    if kind == "mouse_down":
+        return {
+            "pointer": _pointer_body(
+                action["x"],
+                action["y"],
+                "POINTER_ACTION_DOWN",
+                action.get("button", "left"),
+            )
+        }
+    if kind == "mouse_up":
+        return {
+            "pointer": _pointer_body(
+                action["x"],
+                action["y"],
+                "POINTER_ACTION_UP",
+                action.get("button", "left"),
+            )
+        }
+    if kind == "press":
+        modifiers, final_key = _chord_parts(action["key"])
+        return {"key": {"key": final_key, "modifiers": modifiers}}
+    if kind == "write":
+        return {"key": {"text": action["text"]}}
+    if kind == "scroll":
+        return {"scroll": {"dx": action.get("dx", 0), "dy": action.get("dy", 0)}}
+    raise ValueError(f"Unknown desktop action type: {kind!r}")
+
+
+def _format_body(format: str) -> dict[str, str]:
+    # PNG is the server default, so the field is only sent for JPEG and a
+    # boxd that predates JPEG never sees it.
+    if format == "jpeg":
+        return {"format": "FRAME_FORMAT_JPEG"}
+    if format != "png":
+        raise ValueError(f"Unknown frame format: {format!r}")
+    return {}
+
+
+def _decode_screenshot(raw: dict[str, Any]) -> Screenshot:
+    image = raw.get("image")
+    if image is None:
+        raise ValueError("Screenshot response missing image data")
+    return Screenshot(
+        data=base64.b64decode(image),
+        width=raw.get("width", 0),
+        height=raw.get("height", 0),
+        format="jpeg" if raw.get("format") == "FRAME_FORMAT_JPEG" else "png",
+    )
+
+
+@dataclass(frozen=True)
+class StepTimings:
+    """Where the sandbox spent a ``desktop.step()``, in milliseconds."""
+
+    queue_ms: int
+    """Waiting for the sandbox's input lock."""
+    actions_ms: int
+    """Delivering the actions."""
+    settle_ms: int
+    """Sleeping, or waiting for a changed frame."""
+    capture_ms: int
+    """Capturing and encoding the frame."""
+
+
+@dataclass(frozen=True)
+class StepResult:
+    """Outcome of one ``desktop.step()``.
+
+    Input is not idempotent, so a failed action and a failed capture are
+    reported here rather than raised: the actions that ran have already
+    landed either way.
+    """
+
+    executed: int
+    """Actions that executed; the batch size unless ``action_error`` is set."""
+    action_error: str | None = None
+    """Why the batch stopped early; ``executed`` is then the failing index."""
+    screenshot: Screenshot | None = None
+    """Frame captured after the batch stopped; ``None`` when capture failed."""
+    screenshot_error: str | None = None
+    """Why no frame was captured."""
+    changed: bool = False
+    """With ``wait_for_change``: whether the frame differs from the one before
+    the batch. Also ``False`` when the sandbox could not compare frames."""
+    timings: StepTimings | None = None
+    """Sandbox-side phase timings; ``None`` from a sandbox that predates them."""
+
+
+def _step_body(
+    actions: Sequence[dict[str, Any]],
+    settle_ms: int,
+    wait_for_change: bool = False,
+    format: str = "png",
+    quiet_ms: int = 0,
+) -> dict[str, Any]:
+    if not actions:
+        raise ValueError("step: actions is empty")
+    body: dict[str, Any] = {
+        "actions": [_action_body(a) for a in actions],
+        "settleMs": settle_ms,
+        **_format_body(format),
+    }
+    if wait_for_change:
+        body["waitForChange"] = True
+    # Sent only when set, so a sandbox that predates it never sees it.
+    if quiet_ms:
+        body["quietMs"] = quiet_ms
+    return body
+
+
+_PHASES = ("queueMs", "actionsMs", "settleMs", "captureMs")
+
+
+def _decode_step(raw: dict[str, Any]) -> StepResult:
+    executed = raw.get("executed", 0)
+    action_error = raw.get("actionError") or None
+    timings = None
+    if any(k in raw for k in _PHASES):
+        # proto-JSON omits zero-valued fields, so a reported phase can be missing.
+        timings = StepTimings(*(raw.get(k, 0) for k in _PHASES))
+    shot = raw.get("screenshot")
+    if shot is not None and shot.get("image") is not None:
+        return StepResult(
+            executed=executed,
+            action_error=action_error,
+            screenshot=_decode_screenshot(shot),
+            changed=raw.get("changed") is True,
+            timings=timings,
+        )
+    return StepResult(
+        executed=executed,
+        action_error=action_error,
+        screenshot_error=raw.get("captureError") or "Step response missing image data",
+        timings=timings,
+    )
+
+
+def _stream_url(
+    base: str, *, view_only: bool, credential: PreviewToken | None = None
+) -> str:
+    params: dict[str, str] = {"autoconnect": "1", "resize": "scale"}
+    if view_only:
+        params["view_only"] = "1"
+    # A private port needs the signed credential, as get_signed_preview_url
+    # provides: the edge turns it into a cookie on first navigation, which
+    # noVNC's WebSocket then presents.
+    if credential is not None:
+        params[credential.query_param] = credential.token
+    return f"{base}/vnc.html?{urlencode(params)}"
+
+
+class Desktop:
+    """Sync desktop control. Access as ``sandbox.desktop``."""
+
+    def __init__(self, deps: DesktopDeps, client: httpx.Client | None = None) -> None:
+        self._deps = deps
+        self._client = client
+        target = data_plane_target(deps.sandbox_id, deps.sandbox_host)
+        self._data_plane_base_url = target.url
+        self._routing_headers = target.headers
+
+    def screenshot(self, *, format: FrameFormat = "png") -> Screenshot:
+        """Capture the current screen, as a PNG unless ``format`` says otherwise.
+
+        One round trip; safe to call while a live stream viewer is open.
+        """
+        return _decode_screenshot(
+            self._rpc(
+                "Screenshot",
+                _format_body(format),
+                max_bytes=MAX_SCREENSHOT_RESPONSE_BYTES,
+            )
+        )
+
+    def click(self, x: int, y: int, *, button: MouseButton = "left") -> None:
+        """Click at (x, y). One RPC — move and click are a single action."""
+        self._rpc("SendPointer", _pointer_body(x, y, "POINTER_ACTION_CLICK", button))
+
+    def double_click(self, x: int, y: int) -> None:
+        """Double-click at (x, y)."""
+        self._rpc("SendPointer", _pointer_body(x, y, "POINTER_ACTION_DOUBLE_CLICK"))
+
+    def right_click(self, x: int, y: int) -> None:
+        """Right-click at (x, y)."""
+        self.click(x, y, button="right")
+
+    def middle_click(self, x: int, y: int) -> None:
+        """Middle-click at (x, y)."""
+        self.click(x, y, button="middle")
+
+    def move_mouse(self, x: int, y: int) -> None:
+        """Move the pointer to (x, y) without clicking."""
+        self._rpc("SendPointer", _pointer_body(x, y, "POINTER_ACTION_MOVE"))
+
+    def drag(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        *,
+        button: MouseButton = "left",
+    ) -> None:
+        """Drag from ``start`` to ``end`` as one atomic batch (down-move-up)
+        under the sandbox's input lock, so no other input can interleave."""
+        self.actions(
+            [
+                {"type": "mouse_down", "x": start[0], "y": start[1], "button": button},
+                {"type": "move", "x": end[0], "y": end[1]},
+                {"type": "mouse_up", "x": end[0], "y": end[1], "button": button},
+            ]
+        )
+
+    def scroll(self, *, dx: int = 0, dy: int = 0) -> None:
+        """Scroll under the pointer. Positive ``dy`` scrolls down, negative
+        up; ``dx`` scrolls horizontally. Both axes in one call."""
+        self._rpc("Scroll", {"dx": dx, "dy": dy})
+
+    def write(self, text: str) -> None:
+        """Type literal text. Fast by default — no per-character pacing."""
+        if not text:
+            return
+        self._rpc("SendKey", {"text": text})
+
+    def press(self, key: str | Sequence[str]) -> None:
+        """Press a key or chord: ``press("enter")``, ``press("ctrl+c")``,
+        ``press(["ctrl", "shift", "p"])``. Friendly names map to X keysyms;
+        unrecognized names pass through verbatim."""
+        modifiers, final_key = _chord_parts(key)
+        self._rpc("SendKey", {"key": final_key, "modifiers": modifiers})
+
+    def actions(self, actions: Sequence[dict[str, Any]]) -> None:
+        """Execute an ordered batch of actions in a single request.
+
+        The whole batch is validated before anything runs, then executed
+        under the sandbox's input lock. Execution stops at the first failing
+        action. This is the fast path for models that emit several actions
+        per turn.
+
+        Example::
+
+            sandbox.desktop.actions([
+                {"type": "click", "x": 640, "y": 32},
+                {"type": "write", "text": "https://example.com"},
+                {"type": "press", "key": "enter"},
+            ])
+        """
+        if not actions:
+            return
+        self._rpc("SendActions", {"actions": [_action_body(a) for a in actions]})
+
+    def step(
+        self,
+        actions: Sequence[dict[str, Any]],
+        *,
+        settle_ms: int = 0,
+        wait_for_change: bool = False,
+        format: FrameFormat = "png",
+        quiet_ms: int = 0,
+    ) -> StepResult:
+        """Run an ordered batch and capture the frame after it, in one request.
+
+        The act-then-look turn of an agent loop as a single round trip. Same
+        validation and stop-at-first-failure semantics as :meth:`actions`;
+        the frame is captured even when the batch stops early. ``settle_ms``
+        is how long the sandbox waits before capturing, for applications
+        that repaint after the input lands (max 2000). With
+        ``wait_for_change`` the sandbox instead captures the first frame
+        whose pixels differ from the frame before the batch, waiting at most
+        ``settle_ms`` (0 means the sandbox default, 1000); a changed frame
+        proves the display repainted, not that the application finished.
+        ``format`` picks the frame encoding as for :meth:`screenshot`. With
+        ``wait_for_change``, ``quiet_ms`` keeps capturing while repaints keep
+        arriving and returns the frame once the display has been still for
+        that long (bounded by ``settle_ms``), so a batch whose effects land
+        in several paints comes back settled; 0 returns the first changed
+        frame.
+
+        Example::
+
+            result = sandbox.desktop.step(
+                [{"type": "click", "x": 640, "y": 400}], wait_for_change=True
+            )
+            frame = result.screenshot
+        """
+        return _decode_step(
+            self._rpc(
+                "Step",
+                _step_body(actions, settle_ms, wait_for_change, format, quiet_ms),
+                max_bytes=MAX_SCREENSHOT_RESPONSE_BYTES,
+            )
+        )
+
+    def resize(self, width: int, height: int) -> None:
+        """Resize the virtual display. Width must be a multiple of 8 between
+        320 and 8192; height between 200 and 8192. Takes effect live."""
+        self._rpc("Resize", {"width": width, "height": height})
+
+    def get_stream_url(self, *, view_only: bool = False) -> str:
+        """Publish the live desktop viewer (noVNC) and return its browser URL.
+
+        The URL goes through the sandbox's preview-port access policy — under
+        a private policy, viewers also need a preview token.
+        """
+        # Publishing a port and minting its token never resume the VM;
+        # activate first so the viewer is running when the URL is opened.
+        self._deps.refresh_activate()
+        access = self._deps.publish_stream_port()
+        credential = self._deps.mint_stream_token() if access == "private" else None
+        return _stream_url(
+            self._deps.stream_base_url(), view_only=view_only, credential=credential
+        )
+
+    def _rpc(
+        self, method: str, body: dict[str, Any], *, max_bytes: int | None = None
+    ) -> dict[str, Any]:
+        def send(token: str) -> Any:
+            return api_request(
+                "POST",
+                f"{self._data_plane_base_url}{_RPC_BASE}/{method}",
+                headers={
+                    **self._routing_headers,
+                    **routing_hint_headers(self._deps.get_routing_hint),
+                    "X-Access-Token": token,
+                },
+                json_body=body,
+                client=self._client,
+                max_bytes=max_bytes,
+            )
+
+        return with_token_retry(
+            self._deps.get_access_token,
+            self._deps.refresh_activate,
+            send,
+            self._deps.get_routing_hint,
+            self._deps.refresh_expired_hint,
+        )
+
+
+class AsyncDesktop:
+    """Async desktop control. Access as ``sandbox.desktop``."""
+
+    def __init__(
+        self, deps: AsyncDesktopDeps, client: httpx.AsyncClient | None = None
+    ) -> None:
+        self._deps = deps
+        self._client = client
+        target = data_plane_target(deps.sandbox_id, deps.sandbox_host)
+        self._data_plane_base_url = target.url
+        self._routing_headers = target.headers
+
+    async def screenshot(self, *, format: FrameFormat = "png") -> Screenshot:
+        """Async variant of :meth:`Desktop.screenshot`."""
+        return _decode_screenshot(
+            await self._rpc(
+                "Screenshot",
+                _format_body(format),
+                max_bytes=MAX_SCREENSHOT_RESPONSE_BYTES,
+            )
+        )
+
+    async def click(self, x: int, y: int, *, button: MouseButton = "left") -> None:
+        """Async variant of :meth:`Desktop.click`."""
+        await self._rpc(
+            "SendPointer", _pointer_body(x, y, "POINTER_ACTION_CLICK", button)
+        )
+
+    async def double_click(self, x: int, y: int) -> None:
+        """Async variant of :meth:`Desktop.double_click`."""
+        await self._rpc(
+            "SendPointer", _pointer_body(x, y, "POINTER_ACTION_DOUBLE_CLICK")
+        )
+
+    async def right_click(self, x: int, y: int) -> None:
+        """Async variant of :meth:`Desktop.right_click`."""
+        await self.click(x, y, button="right")
+
+    async def middle_click(self, x: int, y: int) -> None:
+        """Async variant of :meth:`Desktop.middle_click`."""
+        await self.click(x, y, button="middle")
+
+    async def move_mouse(self, x: int, y: int) -> None:
+        """Async variant of :meth:`Desktop.move_mouse`."""
+        await self._rpc("SendPointer", _pointer_body(x, y, "POINTER_ACTION_MOVE"))
+
+    async def drag(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        *,
+        button: MouseButton = "left",
+    ) -> None:
+        """Async variant of :meth:`Desktop.drag`."""
+        await self.actions(
+            [
+                {"type": "mouse_down", "x": start[0], "y": start[1], "button": button},
+                {"type": "move", "x": end[0], "y": end[1]},
+                {"type": "mouse_up", "x": end[0], "y": end[1], "button": button},
+            ]
+        )
+
+    async def scroll(self, *, dx: int = 0, dy: int = 0) -> None:
+        """Async variant of :meth:`Desktop.scroll`."""
+        await self._rpc("Scroll", {"dx": dx, "dy": dy})
+
+    async def write(self, text: str) -> None:
+        """Async variant of :meth:`Desktop.write`."""
+        if not text:
+            return
+        await self._rpc("SendKey", {"text": text})
+
+    async def press(self, key: str | Sequence[str]) -> None:
+        """Async variant of :meth:`Desktop.press`."""
+        modifiers, final_key = _chord_parts(key)
+        await self._rpc("SendKey", {"key": final_key, "modifiers": modifiers})
+
+    async def actions(self, actions: Sequence[dict[str, Any]]) -> None:
+        """Async variant of :meth:`Desktop.actions`."""
+        if not actions:
+            return
+        await self._rpc("SendActions", {"actions": [_action_body(a) for a in actions]})
+
+    async def step(
+        self,
+        actions: Sequence[dict[str, Any]],
+        *,
+        settle_ms: int = 0,
+        wait_for_change: bool = False,
+        format: FrameFormat = "png",
+        quiet_ms: int = 0,
+    ) -> StepResult:
+        """Async variant of :meth:`Desktop.step`."""
+        return _decode_step(
+            await self._rpc(
+                "Step",
+                _step_body(actions, settle_ms, wait_for_change, format, quiet_ms),
+                max_bytes=MAX_SCREENSHOT_RESPONSE_BYTES,
+            )
+        )
+
+    async def resize(self, width: int, height: int) -> None:
+        """Async variant of :meth:`Desktop.resize`."""
+        await self._rpc("Resize", {"width": width, "height": height})
+
+    async def get_stream_url(self, *, view_only: bool = False) -> str:
+        """Async variant of :meth:`Desktop.get_stream_url`."""
+        await self._deps.refresh_activate()
+        access = await self._deps.publish_stream_port()
+        credential = (
+            await self._deps.mint_stream_token() if access == "private" else None
+        )
+        return _stream_url(
+            self._deps.stream_base_url(), view_only=view_only, credential=credential
+        )
+
+    async def _rpc(
+        self, method: str, body: dict[str, Any], *, max_bytes: int | None = None
+    ) -> dict[str, Any]:
+        async def send(token: str) -> Any:
+            return await async_api_request(
+                "POST",
+                f"{self._data_plane_base_url}{_RPC_BASE}/{method}",
+                headers={
+                    **self._routing_headers,
+                    **routing_hint_headers(self._deps.get_routing_hint),
+                    "X-Access-Token": token,
+                },
+                json_body=body,
+                client=self._client,
+                max_bytes=max_bytes,
+            )
+
+        return await async_with_token_retry(
+            self._deps.get_access_token,
+            self._deps.refresh_activate,
+            send,
+            self._deps.get_routing_hint,
+            self._deps.refresh_expired_hint,
+        )

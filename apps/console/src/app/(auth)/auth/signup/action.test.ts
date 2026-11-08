@@ -1,0 +1,2062 @@
+const diagnostics = vi.hoisted(() => ({
+  record: vi.fn(),
+  browser: vi.fn(),
+  contexts: vi.fn(),
+}))
+vi.mock("@/lib/fingerprint/diagnostics-server", async (original) => ({
+  ...(await original<typeof import("@/lib/fingerprint/diagnostics-server")>()),
+  fingerprintDiagnostics: (context: unknown) => {
+    diagnostics.contexts(context)
+    return diagnostics
+  },
+}))
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+// Mock dependencies before importing the action
+const mockGenerateLink = vi.fn()
+const mockCreateUser = vi.fn()
+const mockGetUserById = vi.fn()
+const mockCloudflareFlagRpc = vi.fn()
+vi.mock("@/lib/supabase/admin", () => ({
+  createAdminClient: () => ({
+    rpc: mockCloudflareFlagRpc,
+    auth: {
+      admin: {
+        generateLink: mockGenerateLink,
+        createUser: mockCreateUser,
+        getUserById: mockGetUserById,
+      },
+    },
+  }),
+}))
+
+const mockSendEmail = vi.fn()
+vi.mock("@/lib/email/send", () => ({
+  sendEmail: (...args: unknown[]) => mockSendEmail(...args),
+}))
+
+vi.mock("@/lib/email/templates/confirmation", () => ({
+  ConfirmationEmail: (props: { confirmationUrl: string }) =>
+    `ConfirmationEmail:${props.confirmationUrl}`,
+}))
+
+vi.mock("@/lib/email/templates/welcome", () => ({
+  WelcomeEmail: (props: { name: string; dashboardUrl: string }) =>
+    `WelcomeEmail:${props.name}`,
+}))
+
+const mockStrictPlans = vi.fn()
+const mockPricingVersion = vi.fn().mockResolvedValue("legacy")
+vi.mock("@/lib/billing/plans-actions", () => ({
+  getPricingVersionAction: (...args: unknown[]) => mockPricingVersion(...args),
+  getPublicBillingPlansAction: (...args: unknown[]) => mockStrictPlans(...args),
+}))
+const mockUpdateSignupReview = vi.fn()
+vi.mock("@/lib/auth/signup-review-server", () => ({
+  updateSignupReviewMetadata: (...args: unknown[]) =>
+    mockUpdateSignupReview(...args),
+}))
+const mockSlack = vi.fn().mockResolvedValue(undefined)
+vi.mock("@/lib/slack/signup-notification", () => ({
+  notifySlackOfNewUser: (...args: unknown[]) => mockSlack(...args),
+}))
+
+const mockVerifyRecaptcha = vi.fn()
+vi.mock("@/lib/recaptcha/verify", () => ({
+  verifyRecaptcha: (...args: unknown[]) => mockVerifyRecaptcha(...args),
+}))
+
+const mockIssueGoogleSignupProof = vi.fn()
+vi.mock("@/lib/auth/google-signup-proof", () => ({
+  issueGoogleSignupProof: (...args: unknown[]) =>
+    mockIssueGoogleSignupProof(...args),
+}))
+
+const mockObserveCloudflareSignup = vi.fn()
+vi.mock("@/lib/cloudflare/signup-observe", () => ({
+  observeCloudflareSignup: (...args: unknown[]) =>
+    mockObserveCloudflareSignup(...args),
+}))
+
+const mockTrackEvent = vi.fn()
+vi.mock("@/lib/posthog/actions", () => ({
+  trackEvent: (...args: unknown[]) => mockTrackEvent(...args),
+}))
+
+const mockObserveFingerprintSignup = vi.fn()
+const mockResolveFingerprintSignup = vi.fn()
+const mockBeginSignupEvidenceAttempt = vi.fn()
+const mockSaveSignupEvidence = vi.fn()
+const mockIsSupersededSignupEvidenceAttempt = vi.fn()
+const mockEvaluateSignupRestriction = vi.fn()
+vi.mock("@/lib/auth/signup-restrictions", () => ({
+  SignupRestrictedError: class SignupRestrictedError extends Error {},
+  SIGNUP_RESTRICTED_MESSAGE: "Signup is not available. Please try again later.",
+  evaluateSignupRestriction: (...args: unknown[]) =>
+    mockEvaluateSignupRestriction(...args),
+}))
+vi.mock("@/lib/cells", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/cells")>()),
+  cellFor: () => ({ apiBaseUrl: "https://backend.example.test" }),
+}))
+vi.mock("@/lib/fingerprint/observe", () => ({
+  observeFingerprintSignup: (...args: unknown[]) =>
+    mockObserveFingerprintSignup(...args),
+  resolveFingerprintSignup: (...args: unknown[]) =>
+    mockResolveFingerprintSignup(...args),
+}))
+vi.mock("@/lib/auth/signup-evidence", () => ({
+  beginSignupEvidenceAttempt: (...args: unknown[]) =>
+    mockBeginSignupEvidenceAttempt(...args),
+  isSupersededSignupEvidenceAttempt: (...args: unknown[]) =>
+    mockIsSupersededSignupEvidenceAttempt(...args),
+  readSignupEvidence: async () => "VisitorCase",
+  saveSignupEvidence: (...args: unknown[]) => mockSaveSignupEvidence(...args),
+}))
+
+const mockSaveResendTicket = vi.fn()
+const mockReadResendTicket = vi.fn()
+const mockClearResendTicket = vi.fn()
+vi.mock("@/lib/auth/signup-resend", () => ({
+  saveSignupResendTicket: (...args: unknown[]) => mockSaveResendTicket(...args),
+  readSignupResendTicket: (...args: unknown[]) => mockReadResendTicket(...args),
+  clearSignupResendTicket: (...args: unknown[]) =>
+    mockClearResendTicket(...args),
+}))
+
+vi.mock("@/lib/posthog/events", () => ({
+  AUTH_EVENTS: {
+    GOOGLE_SIGNUP_CAPTCHA_FAILED: "auth_google_signup_captcha_failed",
+    GOOGLE_SIGNUP_CAPTCHA_VERIFIED: "auth_google_signup_captcha_verified",
+    SIGNUP_ATTEMPT_ASSOCIATED: "auth_signup_attempt_associated",
+    SIGNUP_RECAPTCHA_OBSERVED: "auth_signup_recaptcha_observed",
+    CLOUDFLARE_SIGNUP_OBSERVED: "auth_cloudflare_signup_observed",
+    CLOUDFLARE_SIGNUP_OBSERVATION_FAILED:
+      "auth_cloudflare_signup_observation_failed",
+  },
+}))
+
+let fingerprintSignupEventId: string | undefined
+const mockFingerprintCookieDelete = vi.fn()
+vi.mock("next/headers", () => ({
+  cookies: async () => ({
+    get: (name: string) =>
+      fingerprintSignupEventId === undefined
+        ? undefined
+        : { name, value: fingerprintSignupEventId },
+    delete: (name: string) => {
+      if (name === "fingerprint_signup_event_id") {
+        fingerprintSignupEventId = undefined
+      }
+      mockFingerprintCookieDelete(name)
+    },
+  }),
+}))
+
+const mockAfter = vi.fn()
+vi.mock("next/server", () => ({
+  after: (callback: () => void | Promise<void>) => mockAfter(callback),
+}))
+
+import { SignupRestrictedError } from "@/lib/auth/signup-restrictions"
+
+import {
+  beginGoogleSignup,
+  resendSignupConfirmation,
+  signUpWithEmail,
+} from "./action"
+
+// verifyRecaptcha reads these at call time (not module load), so these
+// tests — which assert unconfigured (fail-open) behavior and never pass a
+// token — need them explicitly cleared rather than relying on the ambient
+// environment. A dev/CI env with reCAPTCHA configured would otherwise
+// reject every one of these as a missing token.
+const ORIGINAL_RECAPTCHA_ENV = {
+  RECAPTCHA_API_KEY: process.env.RECAPTCHA_API_KEY,
+  RECAPTCHA_PROJECT_ID: process.env.RECAPTCHA_PROJECT_ID,
+  NEXT_PUBLIC_RECAPTCHA_SITE_KEY: process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY,
+}
+
+describe("post-trial signup with the real Cloudflare observer", () => {
+  beforeEach(async () => {
+    const { observeCloudflareSignup } = await vi.importActual<
+      typeof import("@/lib/cloudflare/signup-observe")
+    >("@/lib/cloudflare/signup-observe")
+    mockObserveCloudflareSignup
+      .mockReset()
+      .mockImplementation(observeCloudflareSignup)
+    mockCloudflareFlagRpc
+      .mockReset()
+      .mockResolvedValue({ data: true, error: null })
+    mockCreateUser
+      .mockReset()
+      .mockResolvedValue({ data: { user: { id: "user-1" } }, error: null })
+    mockGenerateLink.mockReset().mockResolvedValue({
+      data: { properties: { hashed_token: "abc123" } },
+      error: null,
+    })
+    mockSendEmail.mockReset().mockResolvedValue({ success: true })
+    mockSlack.mockReset().mockResolvedValue(undefined)
+    mockVerifyRecaptcha.mockReset().mockResolvedValue({ verified: true })
+    mockIssueGoogleSignupProof.mockReset().mockResolvedValue(undefined)
+    mockTrackEvent.mockReset().mockResolvedValue(undefined)
+    fingerprintSignupEventId = undefined
+    vi.stubEnv("CLOUDFLARE_TURNSTILE_SECRET_KEY", "fixture-secret")
+    vi.stubEnv("CLOUDFLARE_SIGNUP_CAPABILITIES", "turnstile_free,ephemeral_id")
+    vi.stubEnv("CLOUDFLARE_SIGNUP_CONFIG_VERSION", "ss-560-expiry-simulation")
+    vi.spyOn(console, "info").mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+    vi.restoreAllMocks()
+  })
+
+  describe.each(["email", "google"] as const)("%s", (method) => {
+    it.each([
+      ["missing field", 200, "success", "missing_expected_signal"],
+      ["entitlement rejected", 403, "http_403", "unavailable"],
+    ] as const)(
+      "preserves signup after %s without changing active configuration",
+      async (_scenario, status, outcome, signalStatus) => {
+        const callbacks: Array<() => void | Promise<void>> = []
+        mockAfter.mockReset().mockImplementation((callback) => {
+          callbacks.push(callback)
+        })
+        const fetchSpy = vi
+          .spyOn(globalThis, "fetch")
+          .mockResolvedValueOnce(
+            new Response(
+              JSON.stringify({
+                success: true,
+                metadata: { ephemeral_id: "fixture-native-id" },
+              }),
+            ),
+          )
+          .mockResolvedValueOnce(
+            new Response(JSON.stringify({ success: true }), { status }),
+          )
+
+        for (const expired of [false, true]) {
+          const result =
+            method === "email"
+              ? await signUpWithEmail(
+                  "user@test.com",
+                  "password123",
+                  "Test User",
+                  "recaptcha-token",
+                  "turnstile-token",
+                )
+              : await beginGoogleSignup("recaptcha-token", "turnstile-token")
+          expect(result.success).toBe(true)
+          expect(callbacks).toHaveLength(1)
+          await expect(
+            Promise.resolve(callbacks.shift()!()),
+          ).resolves.toBeUndefined()
+          const attemptId =
+            mockObserveCloudflareSignup.mock.lastCall![0].signupAttemptId
+          expect(mockTrackEvent).toHaveBeenCalledWith(
+            "auth_signup_recaptcha_observed",
+            attemptId,
+            expect.objectContaining({ signup_attempt_id: attemptId }),
+          )
+          expect(mockTrackEvent).toHaveBeenCalledWith(
+            "auth_cloudflare_signup_observed",
+            expect.any(String),
+            expect.objectContaining({
+              signup_attempt_id: attemptId,
+              signup_method: method,
+              config_version: "ss-560-expiry-simulation",
+              capabilities: ["turnstile_free", "ephemeral_id"],
+              ephemeral_id_expected: true,
+              ephemeral_id: expired ? null : "fixture-native-id",
+              ephemeral_id_status: expired ? signalStatus : "success",
+              provider_outcome: expired ? outcome : "success",
+            }),
+          )
+        }
+        expect(fetchSpy).toHaveBeenCalledTimes(2)
+        expect(mockVerifyRecaptcha).toHaveBeenCalledTimes(2)
+        expect(mockGenerateLink).toHaveBeenCalledTimes(
+          method === "email" ? 2 : 0,
+        )
+        expect(mockSendEmail).toHaveBeenCalledTimes(method === "email" ? 2 : 0)
+        expect(mockIssueGoogleSignupProof).toHaveBeenCalledTimes(
+          method === "google" ? 2 : 0,
+        )
+      },
+    )
+  })
+})
+
+describe("signUpWithEmail", () => {
+  beforeEach(() => {
+    mockPricingVersion.mockReset().mockResolvedValue("legacy")
+    mockStrictPlans.mockReset().mockImplementation(async () => ({
+      pricing_version: await mockPricingVersion(),
+      cards: [],
+    }))
+    mockUpdateSignupReview.mockReset().mockResolvedValue(undefined)
+    mockAfter.mockReset().mockImplementation((callback) => callback())
+    mockCreateUser
+      .mockReset()
+      .mockResolvedValue({ data: { user: { id: "user-1" } }, error: null })
+    mockGenerateLink.mockReset()
+    mockSendEmail.mockReset().mockResolvedValue({ success: true })
+    mockSaveResendTicket.mockReset().mockResolvedValue(true)
+    mockSlack.mockReset().mockResolvedValue(undefined)
+    mockVerifyRecaptcha.mockReset().mockResolvedValue({ verified: true })
+    mockIssueGoogleSignupProof.mockReset().mockResolvedValue(undefined)
+    mockObserveCloudflareSignup.mockReset().mockResolvedValue(undefined)
+    mockTrackEvent.mockReset().mockResolvedValue(undefined)
+    mockObserveFingerprintSignup.mockReset().mockResolvedValue(undefined)
+    mockResolveFingerprintSignup.mockReset().mockResolvedValue("VisitorCase")
+    mockBeginSignupEvidenceAttempt.mockReset().mockResolvedValue(true)
+    mockSaveSignupEvidence.mockReset().mockResolvedValue(undefined)
+    mockEvaluateSignupRestriction.mockReset().mockResolvedValue(undefined)
+    mockIsSupersededSignupEvidenceAttempt.mockReset().mockResolvedValue(false)
+    mockFingerprintCookieDelete.mockReset()
+    fingerprintSignupEventId = undefined
+    delete process.env.RECAPTCHA_API_KEY
+    delete process.env.RECAPTCHA_PROJECT_ID
+    delete process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY
+  })
+
+  afterEach(() => {
+    for (const [name, value] of Object.entries(ORIGINAL_RECAPTCHA_ENV)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+
+  describe("pricing v2 offers", () => {
+    const signUp = (rawOffer: string | undefined, next?: string) => {
+      mockGenerateLink.mockResolvedValue({
+        data: {
+          user: { id: "user-1", created_at: new Date().toISOString() },
+          properties: {
+            hashed_token: "abc123",
+            verification_type: "magiclink",
+          },
+        },
+        error: null,
+      })
+      mockSendEmail.mockResolvedValue({ success: true })
+      return signUpWithEmail(
+        "user@test.com",
+        "password123",
+        "Test User",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        next,
+        rawOffer,
+      )
+    }
+    const callbackOffer = () =>
+      new URL(
+        mockGenerateLink.mock.lastCall![0].options.redirectTo,
+      ).searchParams.get("signup_offer")
+
+    it("keeps today's signup when the switch is off", async () => {
+      const result = await signUp("enterprise")
+
+      expect(result).toEqual({ success: true })
+      expect(callbackOffer()).toBe("enterprise")
+      expect(mockGenerateLink.mock.lastCall![0].type).toBe("signup")
+      expect(mockCreateUser).not.toHaveBeenCalled()
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      expect(mockSendEmail).toHaveBeenCalled()
+      expect(mockSlack.mock.lastCall).toHaveLength(5)
+    })
+
+    it.each(["http_failure", "malformed_catalog"])(
+      "does not create an unheld Enterprise user when pricing is unknown: %s",
+      async (failure) => {
+        const actual = await vi.importActual<
+          typeof import("@/lib/billing/plans-actions")
+        >("@/lib/billing/plans-actions")
+        const previousFetch = globalThis.fetch
+        vi.stubGlobal(
+          "fetch",
+          vi
+            .fn()
+            .mockResolvedValue(
+              new Response(
+                JSON.stringify(
+                  failure === "http_failure" ? {} : { pricing_version: "v2" },
+                ),
+                { status: failure === "http_failure" ? 503 : 200 },
+              ),
+            ),
+        )
+        mockStrictPlans.mockImplementation(actual.getPublicBillingPlansAction)
+        try {
+          const result = await signUp("enterprise")
+          expect(result).toEqual({
+            success: false,
+            error: "Pricing is unavailable. Please try signing up again.",
+          })
+          expect(mockCreateUser).not.toHaveBeenCalled()
+          expect(mockGenerateLink).not.toHaveBeenCalled()
+          expect(mockSendEmail).not.toHaveBeenCalled()
+        } finally {
+          vi.stubGlobal("fetch", previousFetch)
+        }
+      },
+    )
+
+    it.each([
+      ["starter", "developer"],
+      ["pro_monthly", "pro_monthly"],
+      ["free", "free"],
+    ])(
+      "keeps %s routing intent when catalog entry is unavailable",
+      async (offer, routed) => {
+        mockPricingVersion.mockResolvedValue("legacy")
+        await signUp(offer)
+        expect(callbackOffer()).toBe(routed)
+        expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      },
+    )
+
+    it.each(["v2", "legacy"])(
+      "preserves alias navigation without changing accepted terms under %s entry",
+      async (version) => {
+        mockPricingVersion.mockResolvedValue(version)
+        for (const [raw, destination] of [
+          ["starter_monthly", "developer"],
+          ["pro_annual", "pro_monthly"],
+        ]) {
+          await signUp(raw)
+          expect(callbackOffer()).toBe(destination)
+        }
+        expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      },
+    )
+
+    it.each([
+      "/billing/pro/?billing=cancel&team=use%3Ateam&return=%2Fsandboxes",
+      "/billing-usage/buy-credit?amount=500",
+      "/billing-usage/buy-credit?purchase=success&team=use%3Ateam&purchase_id=payment",
+      "/device?code=BCDF-GHJK",
+    ])(
+      "keeps direct purchase entry through the emailed confirmation: %s",
+      async (next) => {
+        await signUp(undefined, next)
+        const redirect = new URL(
+          mockGenerateLink.mock.lastCall![0].options.redirectTo,
+        )
+        expect(redirect.searchParams.get("next")).toBe(next)
+        const confirmation = new URL(
+          mockSendEmail.mock.lastCall![0].react.replace(
+            "ConfirmationEmail:",
+            "",
+          ),
+        )
+        expect(confirmation.searchParams.get("next")).toBe(next)
+        expect(confirmation.searchParams.get("token_hash")).toBe("abc123")
+        expect(confirmation.searchParams.get("type")).toBe("signup")
+        expect(confirmation.searchParams.get("signup_offer")).toBeNull()
+      },
+    )
+    it.each([
+      "https://outside.test/billing/pro",
+      "//outside.test/billing/pro",
+      "/billing/pro?return=https%3A%2F%2Foutside.test",
+      "/device?code=BCDF-GHJK&next=https%3A%2F%2Foutside.test",
+    ])("rejects unsafe emailed purchase returns: %s", async (next) => {
+      await signUp(undefined, next)
+      expect(
+        new URL(
+          mockGenerateLink.mock.lastCall![0].options.redirectTo,
+        ).searchParams.get("next"),
+      ).toBeNull()
+    })
+
+    it.each([
+      `/invite/ssinv_use_${"A".repeat(43)}`,
+      `/invite/ssinv_usw_${"a1_-".repeat(10)}abc`,
+    ])(
+      "keeps an invite link through the emailed confirmation: %s",
+      async (next) => {
+        await signUp(undefined, next)
+        const redirect = new URL(
+          mockGenerateLink.mock.lastCall![0].options.redirectTo,
+        )
+        expect(redirect.searchParams.get("next")).toBe(next)
+      },
+    )
+    it.each([
+      `/invite/ssinv_use_${"A".repeat(42)}`,
+      `/invite/ssinv_eu_${"A".repeat(43)}`,
+      `/invite/ssinv_use_${"A".repeat(43)}/extra`,
+      `/invite/ssinv_use_${"A".repeat(43)}?next=https%3A%2F%2Foutside.test`,
+      `//invite/ssinv_use_${"A".repeat(43)}`,
+      "/invite/",
+    ])("rejects an invalid invite return: %s", async (next) => {
+      await signUp(undefined, next)
+      expect(
+        new URL(
+          mockGenerateLink.mock.lastCall![0].options.redirectTo,
+        ).searchParams.get("next"),
+      ).toBeNull()
+    })
+
+    it("does not ask for the switch without an offer", async () => {
+      await signUp(undefined)
+      expect(mockPricingVersion).not.toHaveBeenCalled()
+    })
+
+    it("holds an Enterprise signup and still confirms the address", async () => {
+      mockPricingVersion.mockResolvedValue("v2")
+
+      const result = await signUp("enterprise")
+
+      expect(result).toEqual({ success: true })
+      expect(callbackOffer()).toBe("enterprise")
+      expect(mockCreateUser).toHaveBeenCalledWith({
+        email: "user@test.com",
+        password: "password123",
+        email_confirm: false,
+        user_metadata: {
+          full_name: "Test User",
+          signup_attempt_id: expect.any(String),
+        },
+        app_metadata: { signup_review: "pending" },
+      })
+      expect(mockGenerateLink.mock.lastCall![0].type).toBe("magiclink")
+      expect(mockSendEmail.mock.lastCall![0].react).toContain("type=magiclink")
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      expect(mockSendEmail).toHaveBeenCalled()
+      expect(mockSlack.mock.lastCall![5]).toBe(true)
+    })
+
+    it("creates no unheld account or confirmation link when Enterprise creation fails", async () => {
+      mockPricingVersion.mockResolvedValue("v2")
+      mockCreateUser.mockResolvedValue({
+        data: { user: null },
+        error: { message: "database unavailable" },
+      })
+      const result = await signUp("enterprise")
+      expect(result.success).toBe(false)
+      expect(mockCreateUser.mock.lastCall![0].app_metadata).toEqual({
+        signup_review: "pending",
+      })
+      expect(mockGenerateLink).not.toHaveBeenCalled()
+      expect(mockSendEmail).not.toHaveBeenCalled()
+    })
+
+    it("leaves the newly created Enterprise account held when link generation fails", async () => {
+      mockPricingVersion.mockResolvedValue("v2")
+      let createdAccount:
+        | { app_metadata: { signup_review: string } }
+        | undefined
+      mockCreateUser.mockImplementation(async (attributes) => {
+        createdAccount = attributes
+        return { data: { user: { id: "user-1", ...attributes } }, error: null }
+      })
+      mockGenerateLink.mockRejectedValueOnce(new Error("link unavailable"))
+      const result = await signUp("enterprise")
+      expect(result.success).toBe(false)
+      expect(createdAccount?.app_metadata.signup_review).toBe("pending")
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      expect(mockSendEmail).not.toHaveBeenCalled()
+    })
+
+    it("carries a self-serve offer without holding the account", async () => {
+      mockPricingVersion.mockResolvedValue("v2")
+
+      await signUp("starter")
+
+      expect(callbackOffer()).toBe("developer")
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      expect(mockSlack.mock.lastCall).toHaveLength(5)
+    })
+  })
+
+  it("returns error for invalid email", async () => {
+    const result = await signUpWithEmail(
+      "not-an-email",
+      "password123",
+      "Test User",
+    )
+    expect(result).toEqual({
+      success: false,
+      error: "Invalid email address.",
+    })
+    expect(mockGenerateLink).not.toHaveBeenCalled()
+  })
+
+  it("returns error for short password", async () => {
+    const result = await signUpWithEmail("user@test.com", "short", "Test User")
+    expect(result).toEqual({
+      success: false,
+      error: "Password must be at least 8 characters.",
+    })
+    expect(mockGenerateLink).not.toHaveBeenCalled()
+  })
+
+  it("returns error for empty name", async () => {
+    const result = await signUpWithEmail("user@test.com", "password123", "")
+    expect(result).toEqual({
+      success: false,
+      error: "Name is required.",
+    })
+    expect(mockGenerateLink).not.toHaveBeenCalled()
+  })
+
+  it.each([undefined, "pro", "pro_monthly", "arbitrary_plan"])(
+    "sends confirmation and Slack with only a valid offer: %s",
+    async (offer) => {
+      mockGenerateLink.mockResolvedValue({
+        data: { properties: { hashed_token: "abc123" } },
+        error: null,
+      })
+      mockSendEmail.mockResolvedValue({ success: true })
+
+      const result = await signUpWithEmail(
+        "user@test.com",
+        "password123",
+        "Test User",
+        undefined,
+        undefined,
+        undefined,
+        offer,
+      )
+
+      const expected =
+        offer === "pro" || offer === "pro_monthly" ? "pro_monthly" : undefined
+      expect(
+        new URL(
+          mockGenerateLink.mock.lastCall![0].options.redirectTo,
+        ).searchParams.get("offer"),
+      ).toBe(expected ?? null)
+      const confirmationUrl = mockSendEmail.mock.lastCall![0].react.replace(
+        "ConfirmationEmail:",
+        "",
+      )
+      expect(new URL(confirmationUrl).searchParams.get("offer")).toBe(
+        expected ?? null,
+      )
+      expect(mockSlack.mock.lastCall![4]).toBe(expected)
+      expect(result).toEqual({ success: true })
+      expect(mockGenerateLink).toHaveBeenCalledWith({
+        type: "signup",
+        email: "user@test.com",
+        password: "password123",
+        options: {
+          data: {
+            full_name: "Test User",
+            signup_attempt_id: expect.any(String),
+          },
+          redirectTo: expect.stringContaining("/auth/callback"),
+        },
+      })
+      expect(mockSendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: "user@test.com",
+          subject: "Confirm your Superserve account",
+        }),
+      )
+    },
+  )
+
+  it("consumes the fingerprint event after lookup so a later attempt cannot reuse it", async () => {
+    fingerprintSignupEventId = encodeURIComponent("event-123")
+    mockGenerateLink.mockResolvedValue({
+      data: {
+        user: { id: "user-1" },
+        properties: { hashed_token: "abc123" },
+      },
+      error: null,
+    })
+    mockSendEmail.mockResolvedValue({ success: true })
+
+    const result = await signUpWithEmail(
+      "user@test.com",
+      "password123",
+      "Test User",
+    )
+    const secondResult = await signUpWithEmail(
+      "user@test.com",
+      "password123",
+      "Test User",
+    )
+
+    expect(result).toEqual({ success: true })
+    expect(secondResult).toEqual({ success: true })
+    expect(mockFingerprintCookieDelete).toHaveBeenCalledExactlyOnceWith(
+      "fingerprint_signup_event_id",
+    )
+    expect(fingerprintSignupEventId).toBeUndefined()
+    expect(mockResolveFingerprintSignup).toHaveBeenCalledTimes(1)
+    expect(mockResolveFingerprintSignup).toHaveBeenNthCalledWith(1, {
+      eventId: "event-123",
+      signupMethod: "email",
+      signupAttemptId: expect.any(String),
+      getObservationUserId: expect.any(Function),
+      capture: undefined,
+      onAttested: expect.any(Function),
+      onAttestationFailed: expect.any(Function),
+    })
+    for (const [args] of mockResolveFingerprintSignup.mock.calls) {
+      expect(args.getObservationUserId()).toBe("user-1")
+    }
+    expect(mockObserveCloudflareSignup).toHaveBeenCalledTimes(2)
+    const cloudflareCalls = mockObserveCloudflareSignup.mock.calls.map(
+      ([args]) =>
+        args as {
+          signupAttemptId: string
+          signupMethod: "email" | "google"
+          userId?: string | null
+          teamId?: string | null
+        },
+    )
+    expect(cloudflareCalls[0]).toMatchObject({
+      signupMethod: "email",
+      userId: undefined,
+      teamId: undefined,
+    })
+    expect(cloudflareCalls[1]).toMatchObject({
+      signupMethod: "email",
+      userId: undefined,
+      teamId: undefined,
+    })
+    expect(cloudflareCalls[0].signupAttemptId).not.toBe(
+      cloudflareCalls[1].signupAttemptId,
+    )
+    expect(mockResolveFingerprintSignup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        signupAttemptId: cloudflareCalls[0].signupAttemptId,
+      }),
+    )
+    expect(mockSaveSignupEvidence).toHaveBeenCalledWith(
+      "user-1",
+      cloudflareCalls[0].signupAttemptId,
+      "event-123",
+      "VisitorCase",
+    )
+    for (const { signupAttemptId } of cloudflareCalls) {
+      expect(mockTrackEvent).toHaveBeenCalledWith(
+        "auth_signup_recaptcha_observed",
+        signupAttemptId,
+        expect.objectContaining({ signup_attempt_id: signupAttemptId }),
+      )
+    }
+  })
+
+  it("keeps a newer fingerprint event when an older lookup finishes", async () => {
+    fingerprintSignupEventId = "event-123"
+    mockResolveFingerprintSignup.mockImplementation(async () => {
+      fingerprintSignupEventId = "event-456"
+      return "VisitorCase"
+    })
+    mockGenerateLink.mockResolvedValue({
+      data: { user: { id: "user-1" }, properties: { hashed_token: "abc123" } },
+      error: null,
+    })
+
+    await expect(
+      signUpWithEmail("user@test.com", "password123", "Test User"),
+    ).resolves.toEqual({ success: true })
+    expect(fingerprintSignupEventId).toBe("event-456")
+    expect(mockFingerprintCookieDelete).not.toHaveBeenCalled()
+    expect(mockSaveSignupEvidence).toHaveBeenCalledWith(
+      "user-1",
+      expect.any(String),
+      "event-123",
+      "VisitorCase",
+    )
+  })
+
+  it.each([new Error("Cookie write failed")])(
+    "sends confirmation after allowed policy despite evidence storage failure: %s",
+    async (failure) => {
+      fingerprintSignupEventId = "event-123"
+      mockGenerateLink.mockResolvedValue({
+        data: {
+          user: { id: "user-1" },
+          properties: { hashed_token: "abc123" },
+        },
+        error: null,
+      })
+      mockSaveSignupEvidence.mockRejectedValue(failure)
+
+      await expect(
+        signUpWithEmail("user@test.com", "password123", "Test User"),
+      ).resolves.toEqual({ success: true })
+      const signupAttemptId =
+        mockGenerateLink.mock.calls[0][0].options.data.signup_attempt_id
+      expect(mockEvaluateSignupRestriction).toHaveBeenCalledWith(
+        "use",
+        signupAttemptId,
+        "VisitorCase",
+      )
+      expect(mockSendEmail).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it("denies with unavailable evidence storage before creating an auth user and allows a later retry", async () => {
+    fingerprintSignupEventId = "event-123"
+    mockGenerateLink.mockResolvedValue({
+      data: { user: { id: "user-1" }, properties: { hashed_token: "abc123" } },
+      error: null,
+    })
+    mockEvaluateSignupRestriction
+      .mockRejectedValueOnce(new SignupRestrictedError())
+      .mockResolvedValueOnce(undefined)
+
+    await expect(
+      signUpWithEmail("user@test.com", "password123", "Test User"),
+    ).resolves.toEqual({
+      success: false,
+      error: "Signup is not available. Please try again later.",
+    })
+    expect(mockGenerateLink).not.toHaveBeenCalled()
+    expect(mockIsSupersededSignupEvidenceAttempt).toHaveBeenCalledWith(
+      expect.any(String),
+    )
+    expect(mockSaveSignupEvidence).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+
+    await expect(
+      signUpWithEmail("user@test.com", "password123", "Test User"),
+    ).resolves.toEqual({ success: true })
+    expect(mockGenerateLink).toHaveBeenCalledTimes(1)
+    expect(mockEvaluateSignupRestriction).toHaveBeenCalledTimes(1)
+    expect(fingerprintSignupEventId).toBeUndefined()
+    expect(mockSaveSignupEvidence).not.toHaveBeenCalled()
+    expect(mockSendEmail).toHaveBeenCalledTimes(1)
+  })
+
+  it("skips restriction evaluation for an attempt superseded by a signed context", async () => {
+    fingerprintSignupEventId = "event-123"
+    mockIsSupersededSignupEvidenceAttempt.mockResolvedValue(true)
+    mockGenerateLink.mockResolvedValue({
+      data: { user: { id: "user-1" }, properties: { hashed_token: "abc123" } },
+      error: null,
+    })
+
+    await expect(
+      signUpWithEmail("user@test.com", "password123", "Test User"),
+    ).resolves.toEqual({ success: true })
+    expect(mockEvaluateSignupRestriction).not.toHaveBeenCalled()
+  })
+
+  it("evaluates verified evidence when a prior signed cookie remains after the new write fails", async () => {
+    fingerprintSignupEventId = "event-123"
+    mockBeginSignupEvidenceAttempt.mockResolvedValue(false)
+    mockIsSupersededSignupEvidenceAttempt.mockResolvedValue(true)
+    mockEvaluateSignupRestriction.mockRejectedValue(new SignupRestrictedError())
+
+    await expect(
+      signUpWithEmail("user@test.com", "password123", "Test User"),
+    ).resolves.toEqual({
+      success: false,
+      error: "Signup is not available. Please try again later.",
+    })
+    expect(mockEvaluateSignupRestriction).toHaveBeenCalledWith(
+      "use",
+      expect.any(String),
+      "VisitorCase",
+    )
+    expect(mockIsSupersededSignupEvidenceAttempt).not.toHaveBeenCalled()
+    expect(mockGenerateLink).not.toHaveBeenCalled()
+  })
+
+  it.each(["off", "unavailable"] as const)(
+    "keeps email signup fail-open when policy is %s and evidence storage fails",
+    async (policy) => {
+      const { evaluateSignupRestriction } = await vi.importActual<
+        typeof import("@/lib/auth/signup-restrictions")
+      >("@/lib/auth/signup-restrictions")
+      const previousToken = process.env.INTERNAL_API_TOKEN
+      const previousFetch = globalThis.fetch
+      try {
+        if (policy === "off") process.env.INTERNAL_API_TOKEN = "test-token"
+        else delete process.env.INTERNAL_API_TOKEN
+        const fetchSpy = vi.fn().mockResolvedValue(
+          new Response(
+            JSON.stringify({
+              mode: "off",
+              decision: "allowed",
+              matched_subject_type: "none",
+            }),
+            { status: 200 },
+          ),
+        )
+        globalThis.fetch = fetchSpy
+        mockEvaluateSignupRestriction.mockImplementation(
+          evaluateSignupRestriction,
+        )
+        fingerprintSignupEventId = "event-123"
+        mockGenerateLink.mockResolvedValue({
+          data: {
+            user: { id: "user-1" },
+            properties: { hashed_token: "abc123" },
+          },
+          error: null,
+        })
+        mockSaveSignupEvidence.mockRejectedValue(
+          new Error("cookie unavailable"),
+        )
+
+        await expect(
+          signUpWithEmail("user@test.com", "password123", "Test User"),
+        ).resolves.toEqual({ success: true })
+        expect(mockSendEmail).toHaveBeenCalledTimes(1)
+        expect(fetchSpy).toHaveBeenCalledTimes(policy === "off" ? 1 : 0)
+      } finally {
+        globalThis.fetch = previousFetch
+        if (previousToken === undefined) delete process.env.INTERNAL_API_TOKEN
+        else process.env.INTERNAL_API_TOKEN = previousToken
+      }
+    },
+  )
+
+  it.each([true, false])(
+    "preserves email signup with reCAPTCHA verified=%s when Cloudflare scheduling throws",
+    async (verified) => {
+      mockAfter.mockImplementationOnce(() => {
+        throw new Error("Request lifecycle unavailable")
+      })
+      mockVerifyRecaptcha.mockResolvedValue({ verified, reason: "low_score" })
+      mockGenerateLink.mockResolvedValue({
+        data: { properties: { hashed_token: "abc123" } },
+        error: null,
+      })
+      mockSendEmail.mockResolvedValue({ success: true })
+
+      const result = await signUpWithEmail(
+        "user@test.com",
+        "password123",
+        "Test User",
+        "recaptcha-token",
+        "turnstile-token",
+      )
+
+      expect(mockAfter).toHaveBeenCalledTimes(1)
+      expect(mockObserveCloudflareSignup).not.toHaveBeenCalled()
+      expect(mockVerifyRecaptcha).toHaveBeenCalledWith(
+        "recaptcha-token",
+        "signup",
+      )
+      expect(result).toEqual(
+        verified
+          ? { success: true }
+          : {
+              success: false,
+              error: "We couldn't verify you're human. Please try again.",
+              errorCode: "captcha_failed",
+            },
+      )
+      expect(mockGenerateLink).toHaveBeenCalledTimes(verified ? 1 : 0)
+      expect(mockSendEmail).toHaveBeenCalledTimes(verified ? 1 : 0)
+    },
+  )
+
+  it("returns error when email is already registered", async () => {
+    mockGenerateLink.mockResolvedValue({
+      data: null,
+      error: { message: "User already registered" },
+    })
+
+    const result = await signUpWithEmail(
+      "existing@test.com",
+      "password123",
+      "Test User",
+    )
+
+    expect(result).toEqual({
+      success: false,
+      error: "An account with this email already exists.",
+    })
+    expect(mockSendEmail).not.toHaveBeenCalled()
+  })
+
+  it("returns error message from supabase on other errors", async () => {
+    mockGenerateLink.mockResolvedValue({
+      data: null,
+      error: { message: "Rate limit exceeded" },
+    })
+
+    const result = await signUpWithEmail(
+      "user@test.com",
+      "password123",
+      "Test User",
+    )
+
+    expect(result).toEqual({
+      success: false,
+      error: "Rate limit exceeded",
+    })
+  })
+
+  it("keeps trigger rejection behavior without claiming a policy block", async () => {
+    mockGenerateLink.mockResolvedValue({
+      data: null,
+      error: { message: "DATABASE ERROR SAVING NEW USER" },
+    })
+    mockSlack.mockRejectedValueOnce(new Error("webhook down"))
+
+    await expect(
+      signUpWithEmail("user@test.com", "password123", "Test User"),
+    ).resolves.toEqual({
+      success: false,
+      error: "Signup is not available for this email address.",
+      errorCode: "blocked_email",
+    })
+    expect(mockSlack).toHaveBeenCalledWith(
+      "user@test.com",
+      "Test User",
+      "email",
+      { kind: "unavailable" },
+      undefined,
+    )
+  })
+
+  it("returns error when token hash is missing", async () => {
+    mockGenerateLink.mockResolvedValue({
+      data: { properties: {} },
+      error: null,
+    })
+
+    const result = await signUpWithEmail(
+      "user@test.com",
+      "password123",
+      "Test User",
+    )
+
+    expect(result).toEqual({
+      success: false,
+      error: "Failed to generate confirmation link.",
+    })
+  })
+
+  it("returns generic error on unexpected exception", async () => {
+    mockGenerateLink.mockRejectedValue(new Error("network error"))
+
+    const result = await signUpWithEmail(
+      "user@test.com",
+      "password123",
+      "Test User",
+    )
+
+    expect(result).toEqual({
+      success: false,
+      error: "Error creating account. Please try again.",
+    })
+  })
+
+  it("notifies slack after successful signup (fire and forget)", async () => {
+    mockGenerateLink.mockResolvedValue({
+      data: { properties: { hashed_token: "abc123" } },
+      error: null,
+    })
+    mockSendEmail.mockResolvedValue({ success: true })
+    mockSlack.mockResolvedValue({ success: true })
+
+    await signUpWithEmail("user@test.com", "password123", "Test User")
+
+    // Slack is called fire-and-forget via .catch(), give it a tick
+    await new Promise((r) => setTimeout(r, 0))
+    expect(mockSlack).toHaveBeenCalled()
+  })
+
+  it("preserves signup when the notification boundary rejects", async () => {
+    mockGenerateLink.mockResolvedValue({
+      data: { properties: { hashed_token: "abc123" } },
+      error: null,
+    })
+    mockSendEmail.mockResolvedValue({ success: true })
+    mockSlack.mockRejectedValueOnce(new Error("webhook down"))
+
+    await expect(
+      signUpWithEmail("user@test.com", "password123", "Test User"),
+    ).resolves.toEqual({ success: true })
+    expect(mockSendEmail).toHaveBeenCalledTimes(1)
+  })
+
+  it("preserves the original rejection when a blocked notification rejects", async () => {
+    fingerprintSignupEventId = "event-blocked"
+    mockEvaluateSignupRestriction.mockRejectedValueOnce(
+      new SignupRestrictedError(),
+    )
+    mockSlack.mockRejectedValueOnce(new Error("webhook down"))
+
+    await expect(
+      signUpWithEmail("user@test.com", "password123", "Test User"),
+    ).resolves.toEqual({
+      success: false,
+      error: "Signup is not available. Please try again later.",
+    })
+    expect(mockGenerateLink).not.toHaveBeenCalled()
+    expect(mockSlack).toHaveBeenCalledWith(
+      "user@test.com",
+      "Test User",
+      "email",
+      { kind: "blocked" },
+      undefined,
+    )
+  })
+})
+
+describe("confirmation email delivery", () => {
+  const SECRET = "a-secret-with-at-least-thirty-two-characters"
+  const previousSecret = process.env.GOOGLE_SIGNUP_PROOF_SECRET
+  const confirmationUrl = () =>
+    new URL(
+      String(mockSendEmail.mock.lastCall![0].react).replace(
+        "ConfirmationEmail:",
+        "",
+      ),
+    )
+  const unconfirmedUser = (sentSecondsAgo: number) => ({
+    data: {
+      user: {
+        id: "user-1",
+        email: "user@example.com",
+        email_confirmed_at: null,
+        confirmation_sent_at: new Date(
+          Date.now() - sentSecondsAgo * 1000,
+        ).toISOString(),
+      },
+    },
+    error: null,
+  })
+  const SHOWN_EMAIL = "user@example.com"
+  const RESEND_UNAVAILABLE_RESULT = {
+    success: false,
+    error:
+      "We can't resend from this page. Sign up again with the same email and password to get a new link.",
+    errorCode: "resend_unavailable",
+  }
+  const ticket = {
+    user: "user-1",
+    type: "signup" as const,
+    redirect:
+      "https://console.example.test/auth/callback?next=%2Fyc%2Faccept%3Fclaim%3Dabc&offer=pro&signup_offer=pro",
+    attempt: "original-attempt",
+  }
+
+  beforeEach(() => {
+    process.env.GOOGLE_SIGNUP_PROOF_SECRET = SECRET
+    delete process.env.RECAPTCHA_API_KEY
+    delete process.env.RECAPTCHA_PROJECT_ID
+    delete process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY
+    mockPricingVersion.mockReset().mockResolvedValue("legacy")
+    mockVerifyRecaptcha.mockReset().mockResolvedValue({ verified: true })
+    mockSendEmail.mockReset().mockResolvedValue({ success: true })
+    mockSlack.mockReset().mockResolvedValue(undefined)
+    mockTrackEvent.mockReset().mockResolvedValue(undefined)
+    mockEvaluateSignupRestriction.mockReset().mockResolvedValue(undefined)
+    mockBeginSignupEvidenceAttempt.mockReset().mockResolvedValue(true)
+    mockIsSupersededSignupEvidenceAttempt.mockReset().mockResolvedValue(false)
+    mockSaveResendTicket.mockReset().mockResolvedValue(true)
+    mockReadResendTicket.mockReset().mockResolvedValue(ticket)
+    mockClearResendTicket.mockReset().mockResolvedValue(undefined)
+    mockGetUserById.mockReset().mockResolvedValue(unconfirmedUser(120))
+    fingerprintSignupEventId = undefined
+    mockGenerateLink.mockReset().mockResolvedValue({
+      data: {
+        user: { id: "user-1", created_at: new Date().toISOString() },
+        properties: { hashed_token: "token", verification_type: "signup" },
+      },
+      error: null,
+    })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    if (previousSecret === undefined)
+      delete process.env.GOOGLE_SIGNUP_PROOF_SECRET
+    else process.env.GOOGLE_SIGNUP_PROOF_SECRET = previousSecret
+    for (const [name, value] of Object.entries(ORIGINAL_RECAPTCHA_ENV)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+
+  describe("signUpWithEmail", () => {
+    it("reports an unsent confirmation instead of success", async () => {
+      mockSendEmail.mockResolvedValue({ success: false })
+
+      const result = await signUpWithEmail(
+        "user@example.com",
+        "password123",
+        "Name",
+      )
+
+      expect(result).toEqual({
+        success: false,
+        error:
+          "Your account was created, but we couldn't send the confirmation email.",
+        errorCode: "email_not_sent",
+      })
+      expect(mockSendEmail).toHaveBeenCalledTimes(1)
+      expect(mockSlack).toHaveBeenCalledTimes(1)
+    })
+
+    it("keeps a resend ticket with the original callback and attempt", async () => {
+      const result = await signUpWithEmail(
+        "user@example.com",
+        "password123",
+        "Name",
+        undefined,
+        undefined,
+        undefined,
+        "pro",
+        undefined,
+        "/yc/accept?claim=11111111-1111-4111-8111-111111111111",
+      )
+
+      expect(result).toEqual({ success: true })
+      const sent = confirmationUrl()
+      const saved = mockSaveResendTicket.mock.lastCall![0]
+      expect(saved).toEqual({
+        user: "user-1",
+        type: "signup",
+        redirect: mockGenerateLink.mock.lastCall![0].options.redirectTo,
+        attempt: sent.searchParams.get("signup_attempt_id"),
+      })
+      const redirect = new URL(saved.redirect)
+      expect(redirect.searchParams.get("next")).toBe(
+        "/yc/accept?claim=11111111-1111-4111-8111-111111111111",
+      )
+      expect(redirect.searchParams.get("offer")).toBe("pro_monthly")
+    })
+  })
+
+  describe("resendSignupConfirmation", () => {
+    it("preserves the invitation through signup and resend with the same attempt", async () => {
+      const invite = `/invite/ssinv_use_${"A".repeat(43)}`
+      expect(
+        await signUpWithEmail(
+          SHOWN_EMAIL,
+          "password123",
+          "Name",
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          invite,
+        ),
+      ).toEqual({ success: true })
+      const original = confirmationUrl()
+      const saved = mockSaveResendTicket.mock.lastCall![0]
+      expect(original.searchParams.get("next")).toBe(invite)
+      expect(new URL(saved.redirect).searchParams.get("next")).toBe(invite)
+      mockReadResendTicket.mockResolvedValue(saved)
+
+      expect(await resendSignupConfirmation(undefined, SHOWN_EMAIL)).toEqual({
+        success: true,
+      })
+
+      const resent = confirmationUrl()
+      expect(resent.searchParams.get("next")).toBe(invite)
+      expect(resent.searchParams.get("signup_attempt_id")).toBe(
+        original.searchParams.get("signup_attempt_id"),
+      )
+      expect(mockGenerateLink.mock.lastCall![0].options.redirectTo).toBe(
+        saved.redirect,
+      )
+    })
+
+    it("sends a new link through the app email path with the original params", async () => {
+      const result = await resendSignupConfirmation("resend-token", SHOWN_EMAIL)
+
+      expect(result).toEqual({ success: true })
+      expect(mockVerifyRecaptcha).toHaveBeenCalledWith(
+        "resend-token",
+        "signup_resend",
+      )
+      expect(mockGetUserById).toHaveBeenCalledWith("user-1")
+      expect(mockGenerateLink).toHaveBeenCalledWith({
+        type: "signup",
+        email: "user@example.com",
+        password: "",
+        options: { redirectTo: ticket.redirect },
+      })
+      expect(mockSendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: "user@example.com",
+          subject: "Confirm your Superserve account",
+        }),
+      )
+      const sent = confirmationUrl()
+      expect(sent.searchParams.get("token_hash")).toBe("token")
+      expect(sent.searchParams.get("type")).toBe("signup")
+      expect(sent.searchParams.get("signup_attempt_id")).toBe(
+        "original-attempt",
+      )
+      expect(sent.searchParams.get("next")).toBe("/yc/accept?claim=abc")
+      expect(sent.searchParams.get("offer")).toBe("pro")
+      expect(sent.searchParams.get("signup_offer")).toBe("pro")
+      expect(sent.searchParams.has("device_bind_proof")).toBe(false)
+    })
+
+    it("signs the device binding again for a bound first link", async () => {
+      mockReadResendTicket.mockResolvedValue({ ...ticket, device: "device-1" })
+
+      await resendSignupConfirmation(undefined, SHOWN_EMAIL)
+
+      const sent = confirmationUrl()
+      expect(sent.searchParams.get("device_attempt_id")).toBe("device-1")
+      expect(sent.searchParams.get("device_bind_proof")).toBeTruthy()
+    })
+
+    it("uses the sign-in link time for an Enterprise magic link", async () => {
+      mockReadResendTicket.mockResolvedValue({ ...ticket, type: "magiclink" })
+      mockGetUserById.mockResolvedValue({
+        data: {
+          user: {
+            id: "user-1",
+            email: "user@example.com",
+            email_confirmed_at: null,
+            confirmation_sent_at: new Date().toISOString(),
+            recovery_sent_at: new Date(Date.now() - 120_000).toISOString(),
+          },
+        },
+        error: null,
+      })
+
+      expect(await resendSignupConfirmation(undefined, SHOWN_EMAIL)).toEqual({
+        success: true,
+      })
+      expect(mockGenerateLink).toHaveBeenCalledWith({
+        type: "magiclink",
+        email: "user@example.com",
+        options: { redirectTo: ticket.redirect },
+      })
+      expect(confirmationUrl().searchParams.get("type")).toBe("magiclink")
+    })
+
+    it("enforces the cooldown from the last server-side send", async () => {
+      mockGetUserById.mockResolvedValue(unconfirmedUser(20))
+
+      const result = await resendSignupConfirmation(undefined, SHOWN_EMAIL)
+
+      expect(result).toMatchObject({
+        success: false,
+        errorCode: "cooldown",
+        retryAfterSeconds: 40,
+      })
+      expect(mockGenerateLink).not.toHaveBeenCalled()
+      expect(mockSendEmail).not.toHaveBeenCalled()
+    })
+
+    it("rejects a failed bot check before any lookup", async () => {
+      mockVerifyRecaptcha.mockResolvedValue({
+        verified: false,
+        providerOutcome: "rejected",
+        reason: "low_score",
+      })
+
+      expect(await resendSignupConfirmation("bad", SHOWN_EMAIL)).toMatchObject({
+        success: false,
+        errorCode: "captcha_failed",
+      })
+      expect(mockReadResendTicket).not.toHaveBeenCalled()
+      expect(mockGetUserById).not.toHaveBeenCalled()
+      expect(mockSendEmail).not.toHaveBeenCalled()
+    })
+
+    it("offers signup again without a ticket from this browser", async () => {
+      mockReadResendTicket.mockResolvedValue(null)
+
+      expect(
+        await resendSignupConfirmation(undefined, SHOWN_EMAIL),
+      ).toMatchObject({
+        success: false,
+        errorCode: "resend_unavailable",
+      })
+      expect(mockGetUserById).not.toHaveBeenCalled()
+      expect(mockGenerateLink).not.toHaveBeenCalled()
+    })
+
+    it("gives the no-ticket answer when the ticket's account is gone", async () => {
+      mockReadResendTicket.mockResolvedValueOnce(null)
+      const noTicket = await resendSignupConfirmation(undefined, SHOWN_EMAIL)
+      mockGetUserById.mockResolvedValue({
+        data: { user: null },
+        error: { message: "User not found" },
+      })
+
+      expect(await resendSignupConfirmation(undefined, SHOWN_EMAIL)).toEqual(
+        noTicket,
+      )
+      expect(mockClearResendTicket).toHaveBeenCalled()
+      expect(mockGenerateLink).not.toHaveBeenCalled()
+    })
+
+    it("does not resend another tab's newer signup", async () => {
+      expect(
+        await resendSignupConfirmation(undefined, "other@example.com"),
+      ).toEqual(RESEND_UNAVAILABLE_RESULT)
+      expect(await resendSignupConfirmation()).toEqual(
+        RESEND_UNAVAILABLE_RESULT,
+      )
+      expect(mockClearResendTicket).not.toHaveBeenCalled()
+      expect(mockGenerateLink).not.toHaveBeenCalled()
+      expect(mockSendEmail).not.toHaveBeenCalled()
+    })
+
+    it("matches the shown email without case or spaces", async () => {
+      expect(
+        await resendSignupConfirmation(undefined, " User@Example.com "),
+      ).toEqual({ success: true })
+    })
+
+    it("sends a confirmed user to sign in without a new link", async () => {
+      mockGetUserById.mockResolvedValue({
+        data: {
+          user: {
+            id: "user-1",
+            email: "user@example.com",
+            email_confirmed_at: new Date().toISOString(),
+          },
+        },
+        error: null,
+      })
+
+      expect(
+        await resendSignupConfirmation(undefined, SHOWN_EMAIL),
+      ).toMatchObject({
+        success: false,
+        errorCode: "already_confirmed",
+      })
+      expect(mockClearResendTicket).toHaveBeenCalled()
+      expect(mockGenerateLink).not.toHaveBeenCalled()
+    })
+
+    it("reports an unsent resend", async () => {
+      mockSendEmail.mockResolvedValue({ success: false })
+
+      expect(
+        await resendSignupConfirmation(undefined, SHOWN_EMAIL),
+      ).toMatchObject({
+        success: false,
+        errorCode: "email_not_sent",
+      })
+    })
+
+    it("sends nothing when Auth returns a link for another user", async () => {
+      mockGenerateLink.mockResolvedValue({
+        data: {
+          user: { id: "someone-else" },
+          properties: { hashed_token: "token" },
+        },
+        error: null,
+      })
+
+      expect(
+        await resendSignupConfirmation(undefined, SHOWN_EMAIL),
+      ).toMatchObject({
+        success: false,
+        errorCode: "email_not_sent",
+      })
+      expect(mockSendEmail).not.toHaveBeenCalled()
+    })
+  })
+})
+
+describe("beginGoogleSignup", () => {
+  beforeEach(() => {
+    mockAfter.mockReset().mockImplementation((callback) => callback())
+    mockObserveCloudflareSignup.mockReset().mockResolvedValue(undefined)
+    mockVerifyRecaptcha.mockReset().mockResolvedValue({ verified: true })
+    mockIssueGoogleSignupProof.mockReset().mockResolvedValue(undefined)
+    mockTrackEvent.mockReset().mockResolvedValue(undefined)
+    mockObserveFingerprintSignup.mockReset().mockResolvedValue(undefined)
+    mockResolveFingerprintSignup.mockReset().mockResolvedValue("VisitorCase")
+    mockBeginSignupEvidenceAttempt.mockReset().mockResolvedValue(true)
+    mockSaveSignupEvidence.mockReset().mockResolvedValue(undefined)
+    mockFingerprintCookieDelete.mockReset()
+    fingerprintSignupEventId = undefined
+  })
+
+  it("verifies signup_google before issuing a proof", async () => {
+    const result = await beginGoogleSignup("google-token", "turnstile-token")
+
+    expect(result).toEqual({
+      success: true,
+      signupAttemptId: expect.any(String),
+    })
+    expect(mockVerifyRecaptcha).toHaveBeenCalledWith(
+      "google-token",
+      "signup_google",
+    )
+    if (!result.success) throw new Error("Expected Google signup to succeed")
+    expect(mockBeginSignupEvidenceAttempt).toHaveBeenCalledExactlyOnceWith(
+      result.signupAttemptId,
+    )
+    expect(
+      mockBeginSignupEvidenceAttempt.mock.invocationCallOrder[0],
+    ).toBeLessThan(mockIssueGoogleSignupProof.mock.invocationCallOrder[0])
+    expect(mockIssueGoogleSignupProof).toHaveBeenCalled()
+    expect(mockAfter).toHaveBeenCalledTimes(1)
+    expect(mockObserveCloudflareSignup).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        signupAttemptId: result.signupAttemptId,
+        signupMethod: "google",
+        turnstileToken: "turnstile-token",
+      }),
+    )
+    expect(mockTrackEvent).toHaveBeenCalledWith(
+      "auth_signup_recaptcha_observed",
+      result.signupAttemptId,
+      expect.objectContaining({ signup_attempt_id: result.signupAttemptId }),
+    )
+    expect(mockTrackEvent).toHaveBeenCalledWith(
+      "auth_google_signup_captcha_verified",
+      expect.any(String),
+      { stage: "captcha_verification" },
+    )
+  })
+
+  it("starts a new evidence context for each Google signup attempt", async () => {
+    const first = await beginGoogleSignup("google-token")
+    const second = await beginGoogleSignup("google-token")
+
+    if (!first.success || !second.success)
+      throw new Error("Expected Google signups to succeed")
+    expect(first.signupAttemptId).not.toBe(second.signupAttemptId)
+    expect(mockBeginSignupEvidenceAttempt.mock.calls).toEqual([
+      [first.signupAttemptId],
+      [second.signupAttemptId],
+    ])
+    for (const index of [0, 1]) {
+      expect(
+        mockBeginSignupEvidenceAttempt.mock.invocationCallOrder[index],
+      ).toBeLessThan(mockIssueGoogleSignupProof.mock.invocationCallOrder[index])
+    }
+  })
+
+  it.each([true, false])(
+    "preserves Google signup with reCAPTCHA verified=%s when Cloudflare scheduling throws",
+    async (verified) => {
+      mockAfter.mockImplementationOnce(() => {
+        throw new Error("Request lifecycle unavailable")
+      })
+      mockVerifyRecaptcha.mockResolvedValue({ verified, reason: "low_score" })
+
+      const result = await beginGoogleSignup("google-token", "turnstile-token")
+
+      expect(mockAfter).toHaveBeenCalledTimes(1)
+      expect(mockObserveCloudflareSignup).not.toHaveBeenCalled()
+      expect(mockVerifyRecaptcha).toHaveBeenCalledWith(
+        "google-token",
+        "signup_google",
+      )
+      expect(result).toEqual(
+        verified
+          ? { success: true, signupAttemptId: expect.any(String) }
+          : {
+              success: false,
+              error: "We couldn't verify you're human. Please try again.",
+              errorCode: "captcha_failed",
+            },
+      )
+      expect(mockIssueGoogleSignupProof).toHaveBeenCalledTimes(verified ? 1 : 0)
+    },
+  )
+
+  it("resolves Google evidence before redirect and consumes its event cookie", async () => {
+    fingerprintSignupEventId = encodeURIComponent("event-456")
+
+    const result = await beginGoogleSignup("google-token")
+
+    expect(result).toEqual({
+      success: true,
+      signupAttemptId: expect.any(String),
+    })
+    expect(mockFingerprintCookieDelete).toHaveBeenCalled()
+    expect(fingerprintSignupEventId).toBeUndefined()
+    expect(mockResolveFingerprintSignup).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: "event-456", signupMethod: "google" }),
+    )
+    expect(mockObserveFingerprintSignup).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when proof issuance is unavailable", async () => {
+    mockIssueGoogleSignupProof.mockRejectedValue(
+      new Error("Google signup proof signing secret is not configured"),
+    )
+
+    await expect(beginGoogleSignup("google-token")).resolves.toEqual({
+      success: false,
+      error: "Google signup is temporarily unavailable. Please try again.",
+      errorCode: "proof_unavailable",
+    })
+    expect(mockTrackEvent).toHaveBeenCalledWith(
+      "auth_google_signup_captcha_failed",
+      expect.any(String),
+      {
+        reason: "Google signup proof signing secret is not configured",
+        stage: "proof_issuance",
+      },
+    )
+  })
+
+  it("returns a captcha error when reCAPTCHA verification fails", async () => {
+    fingerprintSignupEventId = "event-456"
+    mockVerifyRecaptcha.mockResolvedValue({
+      verified: false,
+      reason: "low_score",
+    })
+
+    await expect(beginGoogleSignup("google-token")).resolves.toEqual({
+      success: false,
+      error: "We couldn't verify you're human. Please try again.",
+      errorCode: "captcha_failed",
+    })
+    expect(mockIssueGoogleSignupProof).not.toHaveBeenCalled()
+    expect(fingerprintSignupEventId).toBeUndefined()
+    expect(mockFingerprintCookieDelete).toHaveBeenCalledExactlyOnceWith(
+      "fingerprint_signup_event_id",
+    )
+    expect(mockTrackEvent).toHaveBeenCalledWith(
+      "auth_google_signup_captcha_failed",
+      expect.any(String),
+      {
+        reason: "low_score",
+        stage: "captcha_verification",
+      },
+    )
+  })
+})
+
+const mockOriginalPublication = vi.fn()
+vi.mock("@/lib/api/promotion-publication", () => ({
+  publishOriginalSignupEvidence: (...args: unknown[]) =>
+    mockOriginalPublication(...args),
+}))
+
+describe("original signup promotion evidence", () => {
+  const capture = {
+    attemptId: "original-attempt",
+    challenge: "challenge",
+    eventId: "provider-event",
+  }
+  beforeEach(() => {
+    mockOriginalPublication.mockReset().mockResolvedValue(undefined)
+    mockVerifyRecaptcha.mockReset().mockResolvedValue({ verified: true })
+    mockSendEmail.mockReset().mockResolvedValue({ success: true })
+    mockSlack.mockReset().mockResolvedValue(undefined)
+    mockEvaluateSignupRestriction.mockReset().mockResolvedValue(undefined)
+    mockTrackEvent.mockReset().mockResolvedValue(undefined)
+    mockBeginSignupEvidenceAttempt.mockResolvedValue(true)
+    mockIsSupersededSignupEvidenceAttempt.mockResolvedValue(false)
+    fingerprintSignupEventId = undefined
+    mockResolveFingerprintSignup
+      .mockReset()
+      .mockImplementation(async (input) => {
+        input.onAttested?.()
+        return "ServerVisitor"
+      })
+    mockCreateUser
+      .mockReset()
+      .mockResolvedValue({ data: { user: { id: "user-1" } }, error: null })
+    mockGenerateLink.mockReset().mockImplementation(async () => ({
+      data: {
+        user: { id: "actual-auth-user", created_at: new Date().toISOString() },
+        properties: { hashed_token: "token" },
+      },
+      error: null,
+    }))
+  })
+  it.each([
+    "/yc/accept?claim=11111111-1111-4111-8111-111111111111",
+    "https://evil.example/yc/accept",
+    "/yc/accept?state=funding_ready",
+  ])(
+    "forwards only safe YC return paths into email confirmation: %s",
+    async (next) => {
+      const browserDiagnostics = { schema_version: 1 as const, events: [] }
+      await signUpWithEmail(
+        "user@example.com",
+        "password123",
+        "Name",
+        undefined,
+        undefined,
+        capture,
+        undefined,
+        browserDiagnostics,
+        next,
+      )
+      expect(diagnostics.browser).toHaveBeenCalledWith(browserDiagnostics)
+      const sent = new URL(mockGenerateLink.mock.calls[0][0].options.redirectTo)
+      expect(sent.searchParams.get("next")).toBe(
+        next.startsWith("/yc/accept?claim=") ? next : null,
+      )
+    },
+  )
+
+  it("binds the actual new Auth result before sending confirmation, with one shared lookup", async () => {
+    expect(
+      await signUpWithEmail(
+        "user@example.com",
+        "password123",
+        "Name",
+        undefined,
+        undefined,
+        capture,
+      ),
+    ).toEqual({ success: true })
+    expect(mockResolveFingerprintSignup).toHaveBeenCalledTimes(1)
+    expect(mockOriginalPublication).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "actual-auth-user" }),
+      "original-attempt",
+      false,
+      expect.any(String),
+    )
+    expect(mockOriginalPublication.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSendEmail.mock.invocationCallOrder[0],
+    )
+    expect(mockEvaluateSignupRestriction).toHaveBeenCalledWith(
+      "use",
+      expect.any(String),
+      "ServerVisitor",
+    )
+  })
+
+  it.each([
+    [
+      "eligible",
+      {
+        ownership: "owner",
+        deviceDecision: "eligible",
+        eligibility: "unknown",
+        reason: "team_checks_pending",
+      },
+      { kind: "eligible" },
+    ],
+    [
+      "pre-confirmation identity unavailable",
+      {
+        ownership: "owner",
+        deviceDecision: "eligible",
+        eligibility: "unknown",
+        reason: "verified_identity_missing",
+      },
+      { kind: "eligible" },
+    ],
+    [
+      "historical identity unresolved",
+      {
+        ownership: "owner",
+        deviceDecision: "eligible",
+        eligibility: "unknown",
+        reason: "historical_identity_unresolved",
+      },
+      { kind: "eligible" },
+    ],
+    [
+      "another owner",
+      {
+        ownership: "another_owner",
+        deviceDecision: "owner_conflict",
+        eligibility: "ineligible",
+        reason: "owner_conflict",
+      },
+      { kind: "enforced_other_owner" },
+    ],
+    [
+      "missing evidence",
+      {
+        ownership: "evidence_missing",
+        deviceDecision: "evidence_missing",
+        eligibility: "ineligible",
+        reason: "evidence_missing",
+      },
+      { kind: "enforced_missing_evidence" },
+    ],
+    [
+      "device already redeemed",
+      {
+        ownership: "owner",
+        deviceDecision: "device_already_redeemed",
+        eligibility: "ineligible",
+        reason: "device_already_redeemed",
+      },
+      { kind: "enforced_device_redeemed" },
+    ],
+    [
+      "another owner with enforcement bypassed",
+      {
+        ownership: "another_owner",
+        deviceDecision: "eligible",
+        eligibility: "unknown",
+        reason: "team_checks_pending",
+      },
+      { kind: "unavailable" },
+    ],
+    [
+      "missing evidence with enforcement bypassed",
+      {
+        ownership: "evidence_missing",
+        deviceDecision: "eligible",
+        eligibility: "unknown",
+        reason: "team_checks_pending",
+      },
+      { kind: "unavailable" },
+    ],
+    [
+      "non-device eligibility denial",
+      {
+        ownership: "owner",
+        deviceDecision: "eligible",
+        eligibility: "ineligible",
+        reason: "identity_already_claimed",
+      },
+      { kind: "unavailable" },
+    ],
+  ] as const)(
+    "publishes before notifying with the authoritative %s snapshot",
+    async (_label, snapshot, expected) => {
+      mockOriginalPublication.mockResolvedValue(snapshot)
+
+      await expect(
+        signUpWithEmail(
+          "user@example.com",
+          "password123",
+          "Name",
+          undefined,
+          undefined,
+          capture,
+        ),
+      ).resolves.toEqual({ success: true })
+
+      expect(mockSlack).toHaveBeenCalledWith(
+        "user@example.com",
+        "Name",
+        "email",
+        expected,
+        undefined,
+      )
+      expect(mockOriginalPublication).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "actual-auth-user" }),
+        "original-attempt",
+        false,
+        expect.any(String),
+      )
+      expect(mockOriginalPublication.mock.invocationCallOrder[0]).toBeLessThan(
+        mockSlack.mock.invocationCallOrder[0],
+      )
+    },
+  )
+
+  it("uses unavailable when publication has no authoritative snapshot", async () => {
+    mockOriginalPublication.mockResolvedValue(undefined)
+
+    await expect(
+      signUpWithEmail(
+        "user@example.com",
+        "password123",
+        "Name",
+        undefined,
+        undefined,
+        capture,
+      ),
+    ).resolves.toEqual({ success: true })
+    expect(mockSlack).toHaveBeenCalledWith(
+      "user@example.com",
+      "Name",
+      "email",
+      { kind: "unavailable" },
+      undefined,
+    )
+  })
+
+  it("continues signup with unavailable when publication rejects", async () => {
+    mockOriginalPublication.mockRejectedValueOnce(
+      new Error("publication transport unavailable"),
+    )
+
+    await expect(
+      signUpWithEmail(
+        "user@example.com",
+        "password123",
+        "Name",
+        undefined,
+        undefined,
+        capture,
+      ),
+    ).resolves.toEqual({ success: true })
+    expect(mockSendEmail).toHaveBeenCalledTimes(1)
+    expect(mockSlack).toHaveBeenCalledWith(
+      "user@example.com",
+      "Name",
+      "email",
+      { kind: "unavailable" },
+      undefined,
+    )
+  })
+
+  it("does not attach a new attempt to an older unconfirmed account", async () => {
+    mockGenerateLink.mockResolvedValue({
+      data: {
+        user: { id: "existing-user", created_at: "2020-01-01T00:00:00Z" },
+        properties: { hashed_token: "token" },
+      },
+      error: null,
+    })
+    expect(
+      await signUpWithEmail(
+        "user@example.com",
+        "password123",
+        "Name",
+        undefined,
+        undefined,
+        capture,
+      ),
+    ).toEqual({ success: true })
+    expect(mockOriginalPublication).not.toHaveBeenCalled()
+  })
+  it("preserves attestation authority failures for email and Google signup", async () => {
+    mockResolveFingerprintSignup.mockImplementation(async (input) => {
+      input.onAttestationFailed?.()
+      return "ServerVisitor"
+    })
+    expect(
+      await signUpWithEmail(
+        "user@example.com",
+        "password123",
+        "Name",
+        undefined,
+        undefined,
+        capture,
+      ),
+    ).toEqual({ success: true })
+    expect(mockOriginalPublication).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      false,
+      expect.any(String),
+    )
+    mockIssueGoogleSignupProof.mockClear()
+    expect(
+      await beginGoogleSignup("google-token", undefined, capture),
+    ).toMatchObject({ success: true })
+    expect(mockIssueGoogleSignupProof).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ attemptId: undefined, routineMissing: false }),
+    )
+  })
+
+  it("delegates unattested and absent captures to the backend missing-evidence policy", async () => {
+    mockResolveFingerprintSignup.mockResolvedValue(null)
+    expect(
+      await signUpWithEmail(
+        "user@example.com",
+        "password123",
+        "Name",
+        undefined,
+        undefined,
+        capture,
+      ),
+    ).toEqual({ success: true })
+    expect(mockOriginalPublication).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      true,
+      expect.any(String),
+    )
+    mockOriginalPublication.mockClear()
+    expect(
+      await signUpWithEmail("user@example.com", "password123", "Name"),
+    ).toEqual({ success: true })
+    expect(mockOriginalPublication).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      true,
+      expect.any(String),
+    )
+  })
+})
+
+it("leaves an interrupted capture to the missing-evidence policy after refresh", async () => {
+  mockOriginalPublication.mockReset().mockResolvedValue(undefined)
+  mockVerifyRecaptcha.mockResolvedValue({ verified: true })
+  fingerprintSignupEventId = undefined
+  mockGenerateLink.mockImplementation(async () => ({
+    data: {
+      user: { id: "new-user", created_at: new Date().toISOString() },
+      properties: { hashed_token: "token" },
+    },
+    error: null,
+  }))
+  expect(
+    await signUpWithEmail(
+      "user@example.com",
+      "password123",
+      "Name",
+      undefined,
+      undefined,
+      { unavailable: true },
+    ),
+  ).toEqual({ success: true })
+  expect(mockOriginalPublication).toHaveBeenCalledWith(
+    expect.anything(),
+    undefined,
+    true,
+    expect.any(String),
+  )
+})
+
+it("lets Google signup without a completed capture follow the missing-evidence policy", async () => {
+  mockVerifyRecaptcha.mockResolvedValue({ verified: true })
+  fingerprintSignupEventId = undefined
+  mockIssueGoogleSignupProof.mockClear()
+  expect(
+    await beginGoogleSignup("google-token", undefined, { unavailable: true }),
+  ).toMatchObject({ success: true })
+  expect(mockIssueGoogleSignupProof).toHaveBeenCalledWith(
+    expect.any(String),
+    expect.objectContaining({ attemptId: undefined, routineMissing: true }),
+  )
+})
+
+it.each([undefined, { unavailable: true } as const])(
+  "diagnostic claims cannot change missing-capture Google proof decisions: %j",
+  async (capture) => {
+    mockVerifyRecaptcha.mockResolvedValue({ verified: true })
+    fingerprintSignupEventId = undefined
+    mockIssueGoogleSignupProof.mockClear()
+    const forgedDiagnostics = {
+      schema_version: 1 as const,
+      events: [
+        {
+          stage: "capture" as const,
+          outcome: "succeeded" as const,
+          reason: "completed" as const,
+          occurred_at: new Date().toISOString(),
+          capture_attempt_id: "invented",
+          provider_event_id: "invented",
+        },
+      ],
+    }
+    expect(
+      await beginGoogleSignup(
+        "google-token",
+        undefined,
+        capture,
+        forgedDiagnostics,
+      ),
+    ).toMatchObject({ success: true })
+    expect(mockIssueGoogleSignupProof).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        attemptId: undefined,
+        eventId: undefined,
+        visitor: undefined,
+        routineMissing: true,
+      }),
+    )
+    expect(diagnostics.browser).toHaveBeenCalledWith(forgedDiagnostics)
+  },
+)
